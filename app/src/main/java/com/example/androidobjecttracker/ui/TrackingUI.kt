@@ -204,6 +204,6 @@ fun StatsOverlay(fps: Int, latency: Long) {
         horizontalAlignment = Alignment.Start
     ) {
         Text(text = "FPS: $fps", color = Color.White, fontSize = 14.sp)
-        Text(text = "Latency: ${latency}ms", color = Color.White, fontSize = 14.sp)
+        Text(text = "Latency: $latency ms", color = Color.White, fontSize = 14.sp)
     }
 }

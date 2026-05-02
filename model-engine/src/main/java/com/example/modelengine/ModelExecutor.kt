@@ -7,6 +7,7 @@ import android.os.SystemClock
 import android.util.Log
 import org.pytorch.IValue
 import org.pytorch.Module
+import org.pytorch.PyTorchAndroid
 import org.pytorch.torchvision.TensorImageUtils
 import java.io.File
 import java.io.FileOutputStream
@@ -31,6 +32,11 @@ class ModelExecutor(private val context: Context) {
 
     fun loadModel(assetName: String) {
         try {
+            // Enable CPU Multi-threading for fallback or hybrid execution
+            val numThreads = Runtime.getRuntime().availableProcessors()
+            PyTorchAndroid.setNumThreads(numThreads)
+            Log.d(TAG, "CPU threads set to: $numThreads")
+
             modelPath = assetFilePath(context, assetName)
             Log.d(TAG, "Model path initialized: $modelPath")
         } catch (e: IOException) {
@@ -49,7 +55,7 @@ class ModelExecutor(private val context: Context) {
     fun addTracker(bitmap: Bitmap, bbox: RectF): Int {
         val path = modelPath ?: return -1
         try {
-            // Create a NEW module instance for this specific object
+            // Reverting to standard Module.load to avoid UnsatisfiedLinkError with Lite native libs
             val newModule = Module.load(path)
             
             val templateBitmap = cropTemplate(bitmap, bbox)

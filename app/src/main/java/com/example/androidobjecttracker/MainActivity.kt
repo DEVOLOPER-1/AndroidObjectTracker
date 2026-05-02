@@ -225,39 +225,66 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun scaleBboxToView(bbox: RectF, imgW: Int, imgH: Int): RectF {
-        val viewW = previewView?.width ?: 1
-        val viewH = previewView?.height ?: 1
+        val view = previewView ?: return bbox
+        val viewW = view.width.toFloat()
+        val viewH = view.height.toFloat()
         
-        // CameraX ImageAnalysis usually provides images in a specific orientation.
-        // The bitmap we use is already rotated to match the display.
-        // We need to handle the aspect ratio: CenterCrop or Fit? 
-        // PreviewView usually defaults to FILL_CENTER.
+        // Calculate the scale factors while preserving aspect ratio (FIT_CENTER/FILL_CENTER)
+        // ImageAnalysis usually outputs images in a landscape-like orientation relative to sensor,
+        // but our bitmap is already rotated to match the portrait display.
         
-        val scaleX = viewW.toFloat() / imgW
-        val scaleY = viewH.toFloat() / imgH
+        // If image is 1088x1088 (square) and screen is 720x1560 (tall)
+        // We need to find how that square is mapped into the tall view.
+        val imgAspectRatio = imgW.toFloat() / imgH
+        val viewAspectRatio = viewW / viewH
+
+        var finalScale: Float
+        var offsetX = 0f
+        var offsetY = 0f
+
+        if (viewAspectRatio > imgAspectRatio) {
+            // View is wider than image (relative to aspect ratio)
+            finalScale = viewH / imgH
+            offsetX = (viewW - imgW * finalScale) / 2f
+        } else {
+            // View is taller than image
+            finalScale = viewW / imgW
+            offsetY = (viewH - imgH * finalScale) / 2f
+        }
         
-        // Use the same scale for both if maintaining aspect ratio, 
-        // but here we map directly to the view's pixel space.
         return RectF(
-            bbox.left * scaleX,
-            bbox.top * scaleY,
-            bbox.right * scaleX,
-            bbox.bottom * scaleY
+            bbox.left * finalScale + offsetX,
+            bbox.top * finalScale + offsetY,
+            bbox.right * finalScale + offsetX,
+            bbox.bottom * finalScale + offsetY
         )
     }
 
     private fun scaleBboxToImage(roi: RectF, imgW: Int, imgH: Int): RectF {
-        val viewW = previewView?.width ?: 1
-        val viewH = previewView?.height ?: 1
+        val view = previewView ?: return roi
+        val viewW = view.width.toFloat()
+        val viewH = view.height.toFloat()
         
-        val scaleX = imgW.toFloat() / viewW
-        val scaleY = imgH.toFloat() / viewH
+        val imgAspectRatio = imgW.toFloat() / imgH
+        val viewAspectRatio = viewW / viewH
+
+        var finalScale: Float
+        var offsetX = 0f
+        var offsetY = 0f
+
+        if (viewAspectRatio > imgAspectRatio) {
+            finalScale = viewH / imgH
+            offsetX = (viewW - imgW * finalScale) / 2f
+        } else {
+            finalScale = viewW / imgW
+            offsetY = (viewH - imgH * finalScale) / 2f
+        }
         
         return RectF(
-            roi.left * scaleX,
-            roi.top * scaleY,
-            roi.right * scaleX,
-            roi.bottom * scaleY
+            (roi.left - offsetX) / finalScale,
+            (roi.top - offsetY) / finalScale,
+            (roi.right - offsetX) / finalScale,
+            (roi.bottom - offsetY) / finalScale
         )
     }
 
