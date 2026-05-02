@@ -42,49 +42,48 @@ fun TrackingScreen(
     var isAddingObject by remember { mutableStateOf(false) }
 
     Box(modifier = Modifier.fillMaxSize()) {
-        // 1. Camera Preview
+        // 1. Camera Preview (Bottom Layer)
         AndroidView(
             factory = { previewView },
             modifier = Modifier.fillMaxSize()
         )
 
-        // 2. Overlays
+        // 2. Drawing Layer (Middle Layer)
+        // This Canvas must be fillMaxSize and transparent
         Canvas(
             modifier = Modifier
                 .fillMaxSize()
-                .then(
+                .pointerInput(isAddingObject) {
                     if (isAddingObject) {
-                        Modifier.pointerInput(Unit) {
-                            detectDragGestures(
-                                onDragStart = { offset ->
-                                    selectionStart = offset
-                                    selectionCurrent = offset
-                                },
-                                onDrag = { change, _ ->
-                                    selectionCurrent = change.position
-                                },
-                                onDragEnd = {
-                                    if (selectionStart != null && selectionCurrent != null) {
-                                        val rect = RectF(
-                                            minOf(selectionStart!!.x, selectionCurrent!!.x),
-                                            minOf(selectionStart!!.y, selectionCurrent!!.y),
-                                            maxOf(selectionStart!!.x, selectionCurrent!!.x),
-                                            maxOf(selectionStart!!.y, selectionCurrent!!.y)
-                                        )
-                                        if (rect.width() > 20 && rect.height() > 20) {
-                                            onRoiSelected(rect)
-                                            isAddingObject = false // Exit add mode after selection
-                                        }
+                        detectDragGestures(
+                            onDragStart = { offset ->
+                                selectionStart = offset
+                                selectionCurrent = offset
+                            },
+                            onDrag = { change, _ ->
+                                selectionCurrent = change.position
+                            },
+                            onDragEnd = {
+                                if (selectionStart != null && selectionCurrent != null) {
+                                    val rect = RectF(
+                                        minOf(selectionStart!!.x, selectionCurrent!!.x),
+                                        minOf(selectionStart!!.y, selectionCurrent!!.y),
+                                        maxOf(selectionStart!!.x, selectionCurrent!!.x),
+                                        maxOf(selectionStart!!.y, selectionCurrent!!.y)
+                                    )
+                                    if (rect.width() > 20 && rect.height() > 20) {
+                                        onRoiSelected(rect)
+                                        isAddingObject = false
                                     }
-                                    selectionStart = null
-                                    selectionCurrent = null
                                 }
-                            )
-                        }
-                    } else Modifier
-                )
+                                selectionStart = null
+                                selectionCurrent = null
+                            }
+                        )
+                    }
+                }
         ) {
-            // Draw ROI Selector (while dragging)
+            // Draw ROI Selector
             val start = selectionStart
             val current = selectionCurrent
             if (isAddingObject && start != null && current != null) {
@@ -102,8 +101,9 @@ fun TrackingScreen(
                 )
             }
 
-            // Draw ALL Tracked Bounding Boxes
+            // Draw Tracked Bounding Boxes
             trackedBboxes.forEach { (id, bbox) ->
+                // Ensure coordinates are within canvas bounds
                 drawRect(
                     color = getBoxColor(id),
                     topLeft = Offset(bbox.left, bbox.top),
@@ -113,7 +113,7 @@ fun TrackingScreen(
             }
         }
 
-        // 3. Status/Instruction text
+        // 3. UI Controls and Info (Top Layer)
         if (isAddingObject) {
             Text(
                 text = "Draw a box around the object",
@@ -126,10 +126,8 @@ fun TrackingScreen(
             )
         }
 
-        // 4. Stats Overlay
         StatsOverlay(fps, latency)
 
-        // 5. Controls
         Column(
             modifier = Modifier
                 .align(Alignment.BottomCenter)
@@ -140,7 +138,6 @@ fun TrackingScreen(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(24.dp)
             ) {
-                // Reset Button
                 IconButton(
                     onClick = {
                         onReset()
@@ -153,7 +150,6 @@ fun TrackingScreen(
                     Icon(Icons.Default.Refresh, contentDescription = "Reset", tint = Color.White)
                 }
 
-                // Recording Button
                 IconButton(
                     onClick = onToggleRecording,
                     modifier = Modifier
@@ -164,10 +160,8 @@ fun TrackingScreen(
                         .padding(2.dp)
                         .background(if (isRecording) Color.Red else Color.White, CircleShape)
                 ) {
-                    // Visual indicator for recording
                 }
 
-                // Add Object Button
                 IconButton(
                     onClick = { isAddingObject = !isAddingObject },
                     modifier = Modifier

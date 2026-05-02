@@ -133,8 +133,10 @@ class MainActivity : ComponentActivity() {
         // 1. Process new ROIs
         synchronized(pendingRois) {
             if (pendingRois.isNotEmpty()) {
+                Log.d(TAG, "Processing ${pendingRois.size} pending ROIs")
                 for (roi in pendingRois) {
                     val imageRoi = scaleBboxToImage(roi, bitmap.width, bitmap.height)
+                    Log.d(TAG, "Adding tracker for ROI: $roi -> Image ROI: $imageRoi")
                     modelExecutor.addTracker(bitmap, imageRoi)
                 }
                 pendingRois.clear()
@@ -144,13 +146,23 @@ class MainActivity : ComponentActivity() {
         // 2. Run Tracking
         val results = modelExecutor.trackAll(bitmap)
         
-        // Update UI
-        trackedBboxes = results.mapValues { (_, bbox) ->
-            scaleBboxToView(bbox, bitmap.width, bitmap.height)
+        // Update UI state using a temporary map to trigger recomposition properly
+        val updatedBboxes = results.mapValues { (id, bbox) ->
+            val viewBbox = scaleBboxToView(bbox, bitmap.width, bitmap.height)
+            if (results.size < 5) { // Avoid spamming if many trackers
+                Log.d(TAG, "Object $id: img=$bbox -> view=$viewBbox")
+            }
+            viewBbox
         }
         
-        latency = modelExecutor.getLastInferenceTime()
-        updateFps()
+        // Use the main thread to update Compose state if not already there
+        runOnUiThread {
+            if (updatedBboxes.isNotEmpty() || trackedBboxes.isNotEmpty()) {
+                trackedBboxes = updatedBboxes
+            }
+            latency = modelExecutor.getLastInferenceTime()
+            updateFps()
+        }
     }
 
     private fun startRecording() {
@@ -216,9 +228,16 @@ class MainActivity : ComponentActivity() {
         val viewW = previewView?.width ?: 1
         val viewH = previewView?.height ?: 1
         
+        // CameraX ImageAnalysis usually provides images in a specific orientation.
+        // The bitmap we use is already rotated to match the display.
+        // We need to handle the aspect ratio: CenterCrop or Fit? 
+        // PreviewView usually defaults to FILL_CENTER.
+        
         val scaleX = viewW.toFloat() / imgW
         val scaleY = viewH.toFloat() / imgH
         
+        // Use the same scale for both if maintaining aspect ratio, 
+        // but here we map directly to the view's pixel space.
         return RectF(
             bbox.left * scaleX,
             bbox.top * scaleY,

@@ -97,10 +97,8 @@ class ModelExecutor(private val context: Context) {
         try {
             for (instance in trackingInstances) {
                 val output: IValue = try {
-                    // Try calling 'track' method on this specific instance
                     instance.module.runMethod("track", searchIValue)
                 } catch (e: Exception) {
-                    // Fallback to forward with template and search
                     instance.module.forward(instance.templateIValue, searchIValue)
                 }
 
@@ -110,7 +108,6 @@ class ModelExecutor(private val context: Context) {
                     for (item in tuple) {
                         if (item.isTensor) {
                             val t = item.toTensor()
-                            // Assuming bbox tensor is the one with 4 elements in last dim
                             if (t.shape().last() == 4L) {
                                 found = t
                                 break
@@ -123,7 +120,11 @@ class ModelExecutor(private val context: Context) {
                 }
 
                 val result = resultTensor.dataAsFloatArray
+                Log.d(TAG, "Instance ${instance.id} model output: ${result.joinToString(", ")}")
+                
                 val newBbox = mapResult(result, bitmap.width, bitmap.height, instance.lastBbox)
+                Log.d(TAG, "Instance ${instance.id} mapped bbox: $newBbox (img size: ${bitmap.width}x${bitmap.height})")
+
                 instance.lastBbox = newBbox
                 results[instance.id] = newBbox
             }
@@ -148,18 +149,37 @@ class ModelExecutor(private val context: Context) {
     private fun mapResult(result: FloatArray, imgW: Int, imgH: Int, lastBbox: RectF): RectF {
         if (result.size < 4) return lastBbox
         
-        // Map 256x256 normalized coordinates [0, 1] or [0, 256] to image size
-        // Most models return normalized [x1, y1, x2, y2] or [x, y, w, h]
-        // Assuming [x, y, w, h] in 256 space for this implementation
-        val scaleX = imgW.toFloat() / 256f
-        val scaleY = imgH.toFloat() / 256f
+        // AbaViTrack typically returns normalized [cx, cy, w, h] or [x, y, w, h] 
+        // relative to the search image size (256x256).
+        // Based on Python reference: cv.rectangle(frame_disp, (x, y), (x+w, y+h))
         
-        return RectF(
-            result[0] * scaleX,
-            result[1] * scaleY,
-            (result[0] + result[2]) * scaleX,
-            (result[1] + result[3]) * scaleY
-        )
+        val isNormalized = result.all { it <= 1.1f && it >= -0.1f }
+        val scaleX = if (isNormalized) imgW.toFloat() else imgW.toFloat() / 256f
+        val scaleY = if (isNormalized) imgH.toFloat() else imgH.toFloat() / 256f
+        
+        // If the values look like [center_x, center_y, width, height]
+        // result[0] and result[1] are often ~0.5 in the search window
+        val x: Float
+        val y: Float
+        val w: Float
+        val h: Float
+
+        // Heuristic: if it's AbaViTrack/Stark style, it might be [cx, cy, w, h] normalized
+        if (isNormalized && result[0] > 0.1 && result[1] > 0.1) {
+            // Try [cx, cy, w, h] to [x, y, w, h]
+            w = result[2] * scaleX
+            h = result[3] * scaleY
+            x = (result[0] * scaleX) - (w / 2f)
+            y = (result[1] * scaleY) - (h / 2f)
+        } else {
+            // Assume [x, y, w, h]
+            x = result[0] * scaleX
+            y = result[1] * scaleY
+            w = result[2] * scaleX
+            h = result[3] * scaleY
+        }
+        
+        return RectF(x, y, x + w, y + h)
     }
 
     companion object {
