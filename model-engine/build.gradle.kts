@@ -1,5 +1,5 @@
 plugins {
-    id("com.android.library")
+    alias(libs.plugins.androidLib)
 }
 
 android {
@@ -29,7 +29,7 @@ android {
 
 dependencies {
     implementation(libs.androidx.core.ktx)
-    api(libs.pytorch.lite)
+    api(libs.pytorch.runtime)
     api(libs.pytorch.vision)
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.junit)
