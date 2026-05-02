@@ -24,3 +24,4 @@ dependencyResolutionManagement {
 
 rootProject.name = "AndroidObjectTracker"
 include(":app")
+include(":model-engine")

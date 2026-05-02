@@ -1,5 +1,5 @@
 plugins {
-    alias(libs.plugins.android.application)
+    id("com.android.application")
 }
 
 android {
@@ -36,6 +36,9 @@ android {
 }
 
 dependencies {
+    implementation(project(":model-engine"))
+    implementation(libs.pytorch.lite)
+    implementation(libs.pytorch.vision)
     implementation(libs.androidx.activity.ktx)
     implementation(libs.androidx.appcompat)
     implementation(libs.androidx.constraintlayout)

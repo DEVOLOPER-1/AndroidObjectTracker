@@ -9,6 +9,8 @@ material = "1.10.0"
 camerax = "1.2.2"
 activityKtx = "1.8.0"
 constraintlayout = "2.1.4"
+kotlin = "1.9.0"
+pytorch = "1.13.1"
 
 [libraries]
 androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "coreKtx" }
@@ -25,7 +27,11 @@ androidx-camera-view = { group = "androidx.camera", name = "camera-view", versio
 androidx-camera-extensions = { group = "androidx.camera", name = "camera-extensions", version.ref = "camerax" }
 androidx-activity-ktx = { group = "androidx.activity", name = "activity-ktx", version.ref = "activityKtx" }
 androidx-constraintlayout = { group = "androidx.constraintlayout", name = "constraintlayout", version.ref = "constraintlayout" }
+pytorch-lite = { group = "org.pytorch", name = "pytorch_android_lite", version.ref = "pytorch" }
+pytorch-vision = { group = "org.pytorch", name = "pytorch_android_torchvision_lite", version.ref = "pytorch" }
 
 [plugins]
-android-application = { id = "com.android.application", version.ref = "agp" }
+androidApp = { id = "com.android.application", version.ref = "agp" }
+androidLib = { id = "com.android.library", version.ref = "agp" }
+kotlinAndroid = { id = "org.jetbrains.kotlin.android", version.ref = "kotlin" }
 
