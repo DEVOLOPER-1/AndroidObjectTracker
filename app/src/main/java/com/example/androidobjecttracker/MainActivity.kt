@@ -25,6 +25,7 @@ import androidx.camera.core.resolutionselector.ResolutionSelector
 import androidx.camera.core.resolutionselector.ResolutionStrategy
 import com.example.modelengine.AppLog
 import com.example.modelengine.StaticTracker
+import com.example.modelengine.SOTExecutor
 import com.example.androidobjecttracker.ui.AppState
 import com.example.androidobjecttracker.ui.TrackingScreen
 import androidx.compose.ui.geometry.Offset
@@ -67,6 +68,8 @@ class MainActivity : ComponentActivity() {
     private lateinit var videoProcessor: FastVideoProcessor
     private lateinit var videoEncoder: VideoEncoder
     private val staticTracker = StaticTracker()
+    private lateinit var sotExecutor: SOTExecutor
+    private var useSot by mutableStateOf(false)
 
     // Stats and Metrics
     private var fps by mutableIntStateOf(0)
@@ -85,6 +88,9 @@ class MainActivity : ComponentActivity() {
         
         modelExecutor = ModelExecutor(this)
         modelExecutor.loadModel("yolo26n.ptl")
+        
+        sotExecutor = SOTExecutor(this)
+        sotExecutor.loadModel("AbaViTrack_lite.ptl")
         
         videoProcessor = FastVideoProcessor(this, modelExecutor)
         videoEncoder = VideoEncoder(this)
@@ -111,6 +117,7 @@ class MainActivity : ComponentActivity() {
                 processingEtaMs = processingEtaMs,
                 pins = pins,
                 carPath = carPath,
+                useSot = useSot,
                 finalStats = if (appState == AppState.RESULTS) Pair(finalTimeMillis, pins.count { it.isFallen }) else null,
                 onRecordToggle = {
                     if (appState == AppState.RECORDING) {
@@ -122,12 +129,15 @@ class MainActivity : ComponentActivity() {
                 onPickVideo = {
                     pickVideoLauncher.launch("video/*")
                 },
+                onToggleSot = { useSot = !useSot },
                 onSaveResult = {
                     saveProcessedVideo()
                 },
                 onReset = {
                     appState = AppState.IDLE
                     modelExecutor.reset()
+                    sotExecutor.reset()
+                    staticTracker.reset()
                     trackedObjects = emptyList()
                     currentFrame = null
                     processingProgress = 0f
@@ -152,9 +162,10 @@ class MainActivity : ComponentActivity() {
         }
         
         appState = AppState.PROCESSING
-        AppLog.i("Video processing requested for: $uri")
+        AppLog.i("Video processing requested for: $uri (SOT: $useSot)")
         modelExecutor.reset()
         staticTracker.reset()
+        if (useSot) sotExecutor.reset()
         
         resultVideoFile = null
         resultVideoUri = null
@@ -174,22 +185,41 @@ class MainActivity : ComponentActivity() {
                 },
                 onFrameProcessed = { frame, tracks ->
                     if (frameIndex == 0) {
+                        // tracks are now in frame coordinates (1080p)
                         staticTracker.initialize(tracks.map { SortTracker.Detection(it.bbox, it.classIndex, 1.0f) })
+                        
+                        if (useSot) {
+                            val car = tracks.find { it.classIndex == 0 || it.classIndex == 13 || it.classIndex == 2 }
+                            car?.let { 
+                                AppLog.i("Initializing SOT for car at ${it.bbox}")
+                                sotExecutor.init(frame, it.bbox) 
+                            }
+                        }
+                        
                         videoEncoder.start(frame.width, frame.height, 30, UNDERSAMPLING_FACTOR)
                     } else {
-                        staticTracker.update(tracks.map { SortTracker.Detection(it.bbox, it.classIndex, 1.0f) })
+                        // Hybrid Logic
+                        val detections = tracks.map { SortTracker.Detection(it.bbox, it.classIndex, 1.0f) }
+                        if (useSot) {
+                            val carBbox = sotExecutor.update(frame)
+                            staticTracker.update(detections, carBbox)
+                        } else {
+                            staticTracker.update(detections)
+                        }
                     }
 
                     // Map static objects for UI
                     val pins = staticTracker.getPins()
                     val carPath = staticTracker.getCarPath()
                     
-                    // Update UI (Simplify viewTracks for compatibility)
+                    val oldFrame = currentFrame
                     currentFrame = frame
+                    trackedObjects = emptyList() // Clear old tracks to prioritize static/SOT visuals
                     
-                    // Incremental Encoding with Annotations
+                    // Incremental Encoding with Baked Annotations
                     videoEncoder.addFrame(frame, pins, carPath)
-                    
+
+                    oldFrame?.recycle()
                     frameIndex++
                 }
             )

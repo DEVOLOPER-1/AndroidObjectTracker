@@ -79,8 +79,9 @@ class VideoEncoder(private val context: Context) {
         val codec = this.codec ?: return
         val surface = this.inputSurface ?: return
 
-        // 1. Draw Annotations onto the Bitmap
-        val canvas = Canvas(bitmap)
+        // 1. Create a mutable copy if necessary and draw annotations
+        val annotatedBitmap = if (bitmap.isMutable) bitmap else bitmap.copy(Bitmap.Config.ARGB_8888, true)
+        val canvas = Canvas(annotatedBitmap)
         
         // Draw Car Trace (Persistent line)
         if (carPath.size > 1) {
@@ -110,11 +111,14 @@ class VideoEncoder(private val context: Context) {
         }
 
         // 2. Feed annotated Bitmap to Surface with Correct Timestamp
-        val displayCanvas = surface.lockHardwareCanvas()
-        displayCanvas.drawBitmap(bitmap, 0f, 0f, null)
+        val displayCanvas = surface.lockCanvas(null)
+        val src = Rect(0, 0, annotatedBitmap.width, annotatedBitmap.height)
+        val dst = Rect(0, 0, displayCanvas.width, displayCanvas.height)
+        displayCanvas.drawBitmap(annotatedBitmap, src, dst, null)
         surface.unlockCanvasAndPost(displayCanvas)
 
-        // 3. Drain and increment PTS
+        // 3. Cleanup and Drain
+        if (annotatedBitmap != bitmap) annotatedBitmap.recycle()
         drainEncoder(false)
         currentPtsUs += frameIntervalUs
     }

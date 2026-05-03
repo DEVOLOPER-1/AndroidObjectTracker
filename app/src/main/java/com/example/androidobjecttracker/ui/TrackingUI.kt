@@ -40,19 +40,44 @@ fun TrackingScreen(
     processingEtaMs: Long,
     pins: List<StaticTracker.PinState>,
     carPath: List<PointF>,
+    useSot: Boolean,
     finalStats: Pair<Long, Int>?,
     onRecordToggle: () -> Unit,
     onPickVideo: () -> Unit,
+    onToggleSot: () -> Unit,
     onSaveResult: () -> Unit,
     onReset: () -> Unit
 ) {
     Box(modifier = Modifier.fillMaxSize()) {
         when (appState) {
             AppState.IDLE, AppState.RECORDING -> {
-                CameraCaptureView(previewView, appState == AppState.RECORDING, onRecordToggle, onPickVideo)
+                CameraCaptureView(previewView, appState == AppState.RECORDING, useSot, onRecordToggle, onPickVideo, onToggleSot)
             }
             AppState.PROCESSING -> {
-                ProcessingView(processingProgress, processingEtaMs)
+                Box(modifier = Modifier.fillMaxSize()) {
+                    if (currentFrame != null) {
+                        Image(
+                            bitmap = currentFrame.asImageBitmap(),
+                            contentDescription = null,
+                            modifier = Modifier.fillMaxSize(),
+                            contentScale = ContentScale.Fit
+                        )
+                        
+                        Canvas(modifier = Modifier.fillMaxSize()) {
+                            if (carPath.size > 1) {
+                                val path = Path()
+                                path.moveTo(carPath[0].x, carPath[0].y)
+                                carPath.forEach { p -> path.lineTo(p.x, p.y) }
+                                drawPath(path, Color.Yellow, style = Stroke(width = 2.dp.toPx()))
+                            }
+                            pins.forEach { pin ->
+                                val color = if (pin.isFallen) Color.Red else Color.Green
+                                drawCircle(color, radius = 10.dp.toPx(), center = Offset(pin.currentCentroid.x, pin.currentCentroid.y))
+                            }
+                        }
+                    }
+                    ProcessingView(processingProgress, processingEtaMs)
+                }
             }
             AppState.RESULTS -> {
                 ResultsView(currentFrame, resultVideoUri, pins, carPath, finalStats, onSaveResult, onReset)
@@ -78,12 +103,30 @@ fun Label(text: String, x: Float, y: Float, color: Color) {
 fun CameraCaptureView(
     previewView: PreviewView?,
     isRecording: Boolean,
+    useSot: Boolean,
     onRecordToggle: () -> Unit,
-    onPickVideo: () -> Unit
+    onPickVideo: () -> Unit,
+    onToggleSot: () -> Unit
 ) {
     Box(modifier = Modifier.fillMaxSize()) {
         if (previewView != null) {
             AndroidView(factory = { previewView }, modifier = Modifier.fillMaxSize())
+        }
+        
+        // SOT Toggle
+        if (!isRecording) {
+            Row(
+                modifier = Modifier
+                    .align(Alignment.TopEnd)
+                    .padding(16.dp)
+                    .background(Color.Black.copy(0.6f), RoundedCornerShape(8.dp))
+                    .padding(8.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text("ADVANCED TRACKING", color = Color.White, style = MaterialTheme.typography.labelSmall)
+                Spacer(modifier = Modifier.width(8.dp))
+                Switch(checked = useSot, onCheckedChange = { onToggleSot() })
+            }
         }
         
         // Recording UI
@@ -120,7 +163,7 @@ fun CameraCaptureView(
 
 @Composable
 fun ProcessingView(progress: Float, etaMs: Long) {
-    Box(modifier = Modifier.fillMaxSize().background(Color.Black), contentAlignment = Alignment.Center) {
+    Box(modifier = Modifier.fillMaxSize().background(Color.Black.copy(alpha = 0.4f)), contentAlignment = Alignment.Center) {
         Column(horizontalAlignment = Alignment.CenterHorizontally) {
             CircularProgressIndicator(progress = { progress }, color = Color.Cyan, strokeWidth = 6.dp, modifier = Modifier.size(100.dp))
             Spacer(modifier = Modifier.height(24.dp))

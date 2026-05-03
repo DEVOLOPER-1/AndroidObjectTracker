@@ -24,7 +24,7 @@ class ModelExecutor(private val context: Context) {
     // YOLOv8 Constants
     private val inputWidth = 640
     private val inputHeight = 640
-    private val confidenceThreshold = 0.35f
+    private val confidenceThreshold = 0.20f // Lowered to ensure car is caught
     private val nmsThreshold = 0.45f
 
     fun loadModel(assetName: String) {
@@ -72,15 +72,32 @@ class ModelExecutor(private val context: Context) {
         val data = outputTensor.dataAsFloatArray
 
         // 3. Post-processing: Parse boxes and Apply NMS
-        val detections = if (data.size == 1800) {
+        val rawDetections = if (data.size == 1800) {
             parseEndToEndOutput(data)
         } else {
-            val rawDetections = parseYoloOutput(data)
-            applyNMS(rawDetections)
+            val raw = parseYoloOutput(data)
+            applyNMS(raw)
+        }
+
+        // Scale detections from model space (640x640) to Bitmap space
+        val scaleX = bitmap.width.toFloat() / inputWidth
+        val scaleY = bitmap.height.toFloat() / inputHeight
+        
+        val scaledDetections = rawDetections.map { det ->
+            SortTracker.Detection(
+                RectF(
+                    det.bbox.left * scaleX,
+                    det.bbox.top * scaleY,
+                    det.bbox.right * scaleX,
+                    det.bbox.bottom * scaleY
+                ),
+                det.classIndex,
+                det.confidence
+            )
         }
 
         // 4. Update Tracker
-        val tracks = sortTracker.update(detections)
+        val tracks = sortTracker.update(scaledDetections)
 
         lastInferenceTime = SystemClock.elapsedRealtime() - startTime
         return tracks

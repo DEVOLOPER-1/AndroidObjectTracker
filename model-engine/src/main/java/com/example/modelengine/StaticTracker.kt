@@ -53,7 +53,7 @@ class StaticTracker {
     /**
      * Process a frame and update states based on distance.
      */
-    fun update(currentDetections: List<SortTracker.Detection>) {
+    fun update(currentDetections: List<SortTracker.Detection>, externalCarBbox: RectF? = null) {
         // 1. Update Pins
         pins.forEach { pin ->
             if (!pin.isFallen) {
@@ -79,14 +79,20 @@ class StaticTracker {
         }
 
         // 2. Update Car Path
-        val carDet = currentDetections.find { it.classIndex in CAR_CLASSES }
-        carDet?.let { det ->
-            val lastPoint = carPath.lastOrNull()
-            val newPoint = PointF(det.bbox.centerX(), det.bbox.centerY())
-            
-            if (lastPoint == null || dist(newPoint.x, newPoint.y, lastPoint.x, lastPoint.y) > CAR_MOVE_THRESHOLD) {
-                carPath.add(newPoint)
-                if (carPath.size > 200) carPath.removeAt(0)
+        if (externalCarBbox != null) {
+            val newPoint = PointF(externalCarBbox.centerX(), externalCarBbox.centerY())
+            carPath.add(newPoint)
+            if (carPath.size > 200) carPath.removeAt(0)
+        } else {
+            val carDet = currentDetections.find { it.classIndex in CAR_CLASSES }
+            carDet?.let { det ->
+                val lastPoint = carPath.lastOrNull()
+                val newPoint = PointF(det.bbox.centerX(), det.bbox.centerY())
+                
+                if (lastPoint == null || dist(newPoint.x, newPoint.y, lastPoint.x, lastPoint.y) > CAR_MOVE_THRESHOLD) {
+                    carPath.add(newPoint)
+                    if (carPath.size > 200) carPath.removeAt(0)
+                }
             }
         }
     }
