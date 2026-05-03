@@ -1,209 +1,249 @@
 package com.example.androidobjecttracker.ui
 
-import android.graphics.RectF
+import android.graphics.Bitmap
+import android.graphics.PointF
+import android.net.Uri
+import android.widget.VideoView
 import androidx.camera.view.PreviewView
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
-import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Add
-import androidx.compose.material.icons.filled.Refresh
-import androidx.compose.material3.Icon
-import androidx.compose.material3.IconButton
-import androidx.compose.material3.Text
+import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.Stroke
-import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
+import com.example.modelengine.StaticTracker
+
+enum class AppState {
+    IDLE, RECORDING, PROCESSING, RESULTS
+}
 
 @Composable
 fun TrackingScreen(
-    previewView: PreviewView,
-    trackedBboxes: Map<Int, RectF>,
-    fps: Int,
-    latency: Long,
-    isRecording: Boolean,
-    onRoiSelected: (RectF) -> Unit,
-    onReset: () -> Unit,
-    onToggleRecording: () -> Unit
+    appState: AppState,
+    previewView: PreviewView?,
+    currentFrame: Bitmap?,
+    resultVideoUri: Uri?,
+    processingProgress: Float,
+    processingEtaMs: Long,
+    pins: List<StaticTracker.PinState>,
+    carPath: List<PointF>,
+    finalStats: Pair<Long, Int>?,
+    onRecordToggle: () -> Unit,
+    onPickVideo: () -> Unit,
+    onSaveResult: () -> Unit,
+    onReset: () -> Unit
 ) {
-    var selectionStart by remember { mutableStateOf<Offset?>(null) }
-    var selectionCurrent by remember { mutableStateOf<Offset?>(null) }
-    var isAddingObject by remember { mutableStateOf(false) }
-
     Box(modifier = Modifier.fillMaxSize()) {
-        // 1. Camera Preview (Bottom Layer)
-        AndroidView(
-            factory = { previewView },
-            modifier = Modifier.fillMaxSize()
-        )
-
-        // 2. Drawing Layer (Middle Layer)
-        // This Canvas must be fillMaxSize and transparent
-        Canvas(
-            modifier = Modifier
-                .fillMaxSize()
-                .pointerInput(isAddingObject) {
-                    if (isAddingObject) {
-                        detectDragGestures(
-                            onDragStart = { offset ->
-                                selectionStart = offset
-                                selectionCurrent = offset
-                            },
-                            onDrag = { change, _ ->
-                                selectionCurrent = change.position
-                            },
-                            onDragEnd = {
-                                if (selectionStart != null && selectionCurrent != null) {
-                                    val rect = RectF(
-                                        minOf(selectionStart!!.x, selectionCurrent!!.x),
-                                        minOf(selectionStart!!.y, selectionCurrent!!.y),
-                                        maxOf(selectionStart!!.x, selectionCurrent!!.x),
-                                        maxOf(selectionStart!!.y, selectionCurrent!!.y)
-                                    )
-                                    if (rect.width() > 20 && rect.height() > 20) {
-                                        onRoiSelected(rect)
-                                        isAddingObject = false
-                                    }
-                                }
-                                selectionStart = null
-                                selectionCurrent = null
-                            }
-                        )
-                    }
-                }
-        ) {
-            // Draw ROI Selector
-            val start = selectionStart
-            val current = selectionCurrent
-            if (isAddingObject && start != null && current != null) {
-                drawRect(
-                    color = Color.Yellow,
-                    topLeft = Offset(
-                        minOf(start.x, current.x),
-                        minOf(start.y, current.y)
-                    ),
-                    size = Size(
-                        kotlin.math.abs(current.x - start.x),
-                        kotlin.math.abs(current.y - start.y)
-                    ),
-                    style = Stroke(width = 2.dp.toPx())
-                )
+        when (appState) {
+            AppState.IDLE, AppState.RECORDING -> {
+                CameraCaptureView(previewView, appState == AppState.RECORDING, onRecordToggle, onPickVideo)
             }
-
-            // Draw Tracked Bounding Boxes
-            trackedBboxes.forEach { (id, bbox) ->
-                // Ensure coordinates are within canvas bounds
-                drawRect(
-                    color = getBoxColor(id),
-                    topLeft = Offset(bbox.left, bbox.top),
-                    size = Size(bbox.width(), bbox.height()),
-                    style = Stroke(width = 4.dp.toPx())
-                )
+            AppState.PROCESSING -> {
+                ProcessingView(processingProgress, processingEtaMs)
+            }
+            AppState.RESULTS -> {
+                ResultsView(currentFrame, resultVideoUri, pins, carPath, finalStats, onSaveResult, onReset)
             }
         }
+    }
+}
 
-        // 3. UI Controls and Info (Top Layer)
-        if (isAddingObject) {
-            Text(
-                text = "Draw a box around the object",
-                color = Color.Yellow,
-                modifier = Modifier
-                    .align(Alignment.TopCenter)
-                    .padding(top = 100.dp)
-                    .background(Color.Black.copy(alpha = 0.5f), RoundedCornerShape(4.dp))
-                    .padding(8.dp)
-            )
+@Composable
+fun Label(text: String, x: Float, y: Float, color: Color) {
+    val density = androidx.compose.ui.platform.LocalDensity.current.density
+    Box(
+        modifier = Modifier
+            .offset(x = (x / density).dp, y = (y / density).dp)
+            .background(Color.Black.copy(alpha = 0.6f), RoundedCornerShape(4.dp))
+            .padding(horizontal = 4.dp, vertical = 2.dp)
+    ) {
+        Text(text = text, color = color, fontSize = 10.sp, fontWeight = androidx.compose.ui.text.font.FontWeight.Bold)
+    }
+}
+
+@Composable
+fun CameraCaptureView(
+    previewView: PreviewView?,
+    isRecording: Boolean,
+    onRecordToggle: () -> Unit,
+    onPickVideo: () -> Unit
+) {
+    Box(modifier = Modifier.fillMaxSize()) {
+        if (previewView != null) {
+            AndroidView(factory = { previewView }, modifier = Modifier.fillMaxSize())
         }
-
-        StatsOverlay(fps, latency)
-
+        
+        // Recording UI
         Column(
             modifier = Modifier
                 .align(Alignment.BottomCenter)
-                .padding(bottom = 32.dp),
+                .padding(bottom = 48.dp),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(24.dp)
-            ) {
-                IconButton(
-                    onClick = {
-                        onReset()
-                        isAddingObject = false
-                    },
-                    modifier = Modifier
-                        .background(Color.DarkGray.copy(alpha = 0.7f), CircleShape)
-                        .size(56.dp)
-                ) {
-                    Icon(Icons.Default.Refresh, contentDescription = "Reset", tint = Color.White)
+            if (!isRecording) {
+                Button(onClick = onPickVideo, colors = ButtonDefaults.buttonColors(containerColor = Color.White, contentColor = Color.Black)) {
+                    Text("PICK FROM GALLERY")
                 }
-
-                IconButton(
-                    onClick = onToggleRecording,
-                    modifier = Modifier
-                        .size(72.dp)
-                        .background(if (isRecording) Color.Red else Color.White, CircleShape)
-                        .padding(4.dp)
-                        .background(Color.Black, CircleShape)
-                        .padding(2.dp)
-                        .background(if (isRecording) Color.Red else Color.White, CircleShape)
-                ) {
-                }
-
-                IconButton(
-                    onClick = { isAddingObject = !isAddingObject },
-                    modifier = Modifier
-                        .background(if (isAddingObject) Color.Yellow else Color.DarkGray.copy(alpha = 0.7f), CircleShape)
-                        .size(56.dp)
-                ) {
-                    Icon(
-                        Icons.Default.Add, 
-                        contentDescription = "Add Object", 
-                        tint = if (isAddingObject) Color.Black else Color.White
-                    )
-                }
+                Spacer(modifier = Modifier.height(16.dp))
             }
             
+            IconButton(
+                onClick = onRecordToggle,
+                modifier = Modifier
+                    .size(80.dp)
+                    .background(Color.White, CircleShape)
+                    .padding(4.dp)
+                    .background(Color.Black, CircleShape)
+                    .padding(2.dp)
+                    .background(if (isRecording) Color.Red else Color.White, CircleShape)
+            ) {}
+            
             if (isRecording) {
+                Text("RECORDING...", color = Color.Red, modifier = Modifier.padding(top = 8.dp), style = MaterialTheme.typography.labelLarge)
+            }
+        }
+    }
+}
+
+@Composable
+fun ProcessingView(progress: Float, etaMs: Long) {
+    Box(modifier = Modifier.fillMaxSize().background(Color.Black), contentAlignment = Alignment.Center) {
+        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            CircularProgressIndicator(progress = { progress }, color = Color.Cyan, strokeWidth = 6.dp, modifier = Modifier.size(100.dp))
+            Spacer(modifier = Modifier.height(24.dp))
+            Text("PROCESSING VIDEO...", color = Color.White, style = MaterialTheme.typography.headlineSmall)
+            Text("${(progress * 100).toInt()}%", color = Color.Cyan, modifier = Modifier.padding(top = 8.dp))
+            
+            if (etaMs > 0) {
                 Text(
-                    text = "RECORDING",
-                    color = Color.Red,
-                    fontSize = 12.sp,
-                    modifier = Modifier.padding(top = 8.dp)
+                    text = "Estimated time remaining: ${etaMs / 1000}s",
+                    color = Color.White.copy(alpha = 0.7f),
+                    modifier = Modifier.padding(top = 16.dp),
+                    style = MaterialTheme.typography.bodyMedium
+                )
+            } else {
+                Text(
+                    text = "Calculating ETA...",
+                    color = Color.White.copy(alpha = 0.5f),
+                    modifier = Modifier.padding(top = 16.dp),
+                    style = MaterialTheme.typography.bodyMedium
                 )
             }
         }
     }
 }
 
-fun getBoxColor(id: Int): Color {
-    val colors = listOf(Color.Green, Color.Cyan, Color.Magenta, Color.Yellow, Color.Red, Color.Blue)
-    return colors[id % colors.size]
-}
-
 @Composable
-fun StatsOverlay(fps: Int, latency: Long) {
-    Column(
-        modifier = Modifier
-            .padding(16.dp)
-            .background(Color.Black.copy(alpha = 0.6f), RoundedCornerShape(8.dp))
-            .padding(8.dp)
-            .width(120.dp),
-        horizontalAlignment = Alignment.Start
-    ) {
-        Text(text = "FPS: $fps", color = Color.White, fontSize = 14.sp)
-        Text(text = "Latency: $latency ms", color = Color.White, fontSize = 14.sp)
+fun ResultsView(
+    frame: Bitmap?,
+    videoUri: Uri?,
+    pins: List<StaticTracker.PinState>,
+    carPath: List<PointF>,
+    stats: Pair<Long, Int>?,
+    onSave: () -> Unit,
+    onReset: () -> Unit
+) {
+    Box(modifier = Modifier.fillMaxSize().background(Color.Black)) {
+        if (videoUri != null) {
+            AndroidView(
+                factory = { context ->
+                    VideoView(context).apply {
+                        setVideoURI(videoUri)
+                        setOnPreparedListener { it.isLooping = true }
+                        start()
+                    }
+                },
+                modifier = Modifier.fillMaxSize()
+            )
+        } else if (frame != null) {
+            Image(
+                bitmap = frame.asImageBitmap(),
+                contentDescription = null,
+                modifier = Modifier.fillMaxSize(),
+                contentScale = ContentScale.Fit
+            )
+            
+            Canvas(modifier = Modifier.fillMaxSize()) {
+                // Draw Car trace
+                if (carPath.size > 1) {
+                    val path = Path()
+                    path.moveTo(carPath[0].x, carPath[0].y)
+                    carPath.forEach { p -> path.lineTo(p.x, p.y) }
+                    drawPath(path, Color.Yellow, style = Stroke(width = 2.dp.toPx()))
+                }
+                
+                // Draw Pins
+                pins.forEach { pin ->
+                    val color = if (pin.isFallen) Color.Red else Color.Green
+                    drawCircle(color, radius = 10.dp.toPx(), center = Offset(pin.currentCentroid.x, pin.currentCentroid.y))
+                }
+            }
+
+            // Labels Layer
+            Box(modifier = Modifier.fillMaxSize()) {
+                // Car Label
+                if (carPath.isNotEmpty()) {
+                    val last = carPath.last()
+                    Label(text = "RC CAR", x = last.x, y = last.y - 40, color = Color.Cyan)
+                }
+
+                // Pin Labels
+                pins.forEach { pin ->
+                    if (pin.isFallen) {
+                        Label(text = "#${pin.fallOrder}", x = pin.currentCentroid.x, y = pin.currentCentroid.y, color = Color.Red)
+                    } else {
+                        Label(text = "PIN", x = pin.currentCentroid.x, y = pin.currentCentroid.y - 40, color = Color.White)
+                    }
+                }
+            }
+        }
+
+        // Top Stats Overlay
+        stats?.let { (time, count) ->
+            Column(
+                modifier = Modifier
+                    .padding(16.dp)
+                    .background(Color.Black.copy(0.7f), RoundedCornerShape(8.dp))
+                    .padding(12.dp)
+            ) {
+                Text("Run Time: ${time / 1000}s", color = Color.White)
+                Text("Pins Hit: $count", color = Color.Yellow, style = MaterialTheme.typography.titleLarge)
+            }
+        }
+
+        // Bottom Actions
+        Row(
+            modifier = Modifier
+                .align(Alignment.BottomCenter)
+                .padding(32.dp)
+                .fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceEvenly
+        ) {
+            Button(
+                onClick = onReset,
+                colors = ButtonDefaults.buttonColors(containerColor = Color.Gray)
+            ) {
+                Text("RESTART")
+            }
+            Button(
+                onClick = onSave,
+                colors = ButtonDefaults.buttonColors(containerColor = Color.Cyan, contentColor = Color.Black)
+            ) {
+                Text("SAVE VIDEO")
+            }
+        }
     }
 }

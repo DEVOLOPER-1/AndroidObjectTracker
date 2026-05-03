@@ -4,7 +4,6 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.RectF
 import android.os.SystemClock
-import android.util.Log
 import org.pytorch.IValue
 import org.pytorch.Module
 import org.pytorch.PyTorchAndroid
@@ -14,182 +13,189 @@ import java.io.FileOutputStream
 import java.io.IOException
 
 /**
- * ModelExecutor handles the loading and execution of PyTorch Lite tracking models.
- * Supports multiple tracked objects by maintaining separate model instances.
+ * ModelExecutor handles the loading and execution of YOLOv8 TorchScript Lite models.
  */
 class ModelExecutor(private val context: Context) {
     private var modelPath: String? = null
+    private var module: Module? = null
     private var lastInferenceTime: Long = 0
-    
-    private val trackingInstances = mutableListOf<TrackingInstance>()
+    private val sortTracker = SortTracker()
 
-    private class TrackingInstance(
-        val id: Int,
-        val module: Module,
-        var templateIValue: IValue,
-        var lastBbox: RectF
-    )
+    // YOLOv8 Constants
+    private val inputWidth = 640
+    private val inputHeight = 640
+    private val confidenceThreshold = 0.35f
+    private val nmsThreshold = 0.45f
 
     fun loadModel(assetName: String) {
         try {
-            // Enable CPU Multi-threading for fallback or hybrid execution
             val numThreads = Runtime.getRuntime().availableProcessors()
             PyTorchAndroid.setNumThreads(numThreads)
-            Log.d(TAG, "CPU threads set to: $numThreads")
+            AppLog.i("Setting CPU threads to: $numThreads")
 
             modelPath = assetFilePath(context, assetName)
-            Log.d(TAG, "Model path initialized: $modelPath")
+            module = Module.load(modelPath)
+            AppLog.i("Model successfully loaded from: $modelPath")
         } catch (e: IOException) {
-            Log.e(TAG, "Model path initialization failed", e)
+            AppLog.e("Model loading failed", e)
         }
     }
 
     fun reset() {
-        trackingInstances.clear()
+        sortTracker.reset()
         lastInferenceTime = 0
     }
 
     /**
-     * Initializes a new tracker instance for a new object.
+     * Executes YOLO inference on the full frame and updates object tracks.
      */
-    fun addTracker(bitmap: Bitmap, bbox: RectF): Int {
-        val path = modelPath ?: return -1
-        try {
-            // Reverting to standard Module.load to avoid UnsatisfiedLinkError with Lite native libs
-            val newModule = Module.load(path)
-            
-            val templateBitmap = cropTemplate(bitmap, bbox)
-            val resizedTemplate = Bitmap.createScaledBitmap(templateBitmap, 128, 128, true)
-            
-            val inputTensor = TensorImageUtils.bitmapToFloat32Tensor(
-                resizedTemplate,
-                TensorImageUtils.TORCHVISION_NORM_MEAN_RGB,
-                TensorImageUtils.TORCHVISION_NORM_STD_RGB
-            )
-            val templateIValue = IValue.from(inputTensor)
+    fun detectAndTrack(bitmap: Bitmap): List<SortTracker.Track> {
+        val moduleInstance = module ?: return emptyList()
+        val startTime = SystemClock.elapsedRealtime()
 
-            // Initialize this specific module instance
-            try {
-                newModule.runMethod("initialize", templateIValue)
-            } catch (e: Exception) {
-                Log.d(TAG, "'initialize' method not found for instance, will use forward")
-            }
-
-            val id = if (trackingInstances.isEmpty()) 0 else trackingInstances.maxOf { it.id } + 1
-            trackingInstances.add(TrackingInstance(id, newModule, templateIValue, bbox))
-            Log.d(TAG, "Added tracker instance $id")
-            return id
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to add tracker instance", e)
-            return -1
+        // 1. Pre-processing: Resize and Normalize
+        val resizedBitmap = Bitmap.createScaledBitmap(bitmap, inputWidth, inputHeight, true)
+        val inputTensor = TensorImageUtils.bitmapToFloat32Tensor(
+            resizedBitmap,
+            floatArrayOf(0f, 0f, 0f), // YOLO typically expects 0-1, so mean 0, std 1
+            floatArrayOf(1f, 1f, 1f)
+        )
+        
+        // Recycle resized bitmap if it was a copy
+        if (resizedBitmap != bitmap) {
+            resizedBitmap.recycle()
         }
+
+        // 2. Inference
+        val output = moduleInstance.forward(IValue.from(inputTensor))
+        val outputTensor = output.toTensor()
+        val data = outputTensor.dataAsFloatArray
+
+        // 3. Post-processing: Parse boxes and Apply NMS
+        val detections = if (data.size == 1800) {
+            parseEndToEndOutput(data)
+        } else {
+            val rawDetections = parseYoloOutput(data)
+            applyNMS(rawDetections)
+        }
+
+        // 4. Update Tracker
+        val tracks = sortTracker.update(detections)
+
+        lastInferenceTime = SystemClock.elapsedRealtime() - startTime
+        return tracks
     }
 
-    fun trackAll(bitmap: Bitmap): Map<Int, RectF> {
-        val results = mutableMapOf<Int, RectF>()
-        if (trackingInstances.isEmpty()) return results
-
-        val startTime = SystemClock.elapsedRealtime()
+    private fun parseYoloOutput(data: FloatArray): List<SortTracker.Detection> {
+        val detections = mutableListOf<SortTracker.Detection>()
+        val numPredictions = 8400
+        val numClasses = 3
         
-        // Prepare search tensor once for all instances (assuming they use same search size)
-        val resizedSearch = Bitmap.createScaledBitmap(bitmap, 256, 256, true)
-        val searchTensor = TensorImageUtils.bitmapToFloat32Tensor(
-            resizedSearch,
-            TensorImageUtils.TORCHVISION_NORM_MEAN_RGB,
-            TensorImageUtils.TORCHVISION_NORM_STD_RGB
-        )
-        val searchIValue = IValue.from(searchTensor)
-
-        try {
-            for (instance in trackingInstances) {
-                val output: IValue = try {
-                    instance.module.runMethod("track", searchIValue)
-                } catch (e: Exception) {
-                    instance.module.forward(instance.templateIValue, searchIValue)
-                }
-
-                val resultTensor = if (output.isTuple) {
-                    val tuple = output.toTuple()
-                    var found: org.pytorch.Tensor? = null
-                    for (item in tuple) {
-                        if (item.isTensor) {
-                            val t = item.toTensor()
-                            if (t.shape().last() == 4L) {
-                                found = t
-                                break
-                            }
-                        }
-                    }
-                    found ?: tuple[0].toTensor()
-                } else {
-                    output.toTensor()
-                }
-
-                val result = resultTensor.dataAsFloatArray
-                Log.d(TAG, "Instance ${instance.id} model output: ${result.joinToString(", ")}")
-                
-                val newBbox = mapResult(result, bitmap.width, bitmap.height, instance.lastBbox)
-                Log.d(TAG, "Instance ${instance.id} mapped bbox: $newBbox (img size: ${bitmap.width}x${bitmap.height})")
-
-                instance.lastBbox = newBbox
-                results[instance.id] = newBbox
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "Tracking loop failed", e)
+        val expectedSize = (4 + numClasses) * numPredictions
+        if (data.size != expectedSize) {
+            AppLog.e("YOLO output data size mismatch: expected $expectedSize, got ${data.size}")
+            return detections
         }
-        
-        lastInferenceTime = SystemClock.elapsedRealtime() - startTime
-        return results
+
+        for (i in 0 until numPredictions) {
+            var maxProb = 0f
+            var classIdx = -1
+            for (c in 0 until numClasses) {
+                val prob = data[ (4 + c) * numPredictions + i ]
+                if (prob > maxProb) {
+                    maxProb = prob
+                    classIdx = c
+                }
+            }
+
+            if (maxProb > confidenceThreshold) {
+                val cx = data[ 0 * numPredictions + i ]
+                val cy = data[ 1 * numPredictions + i ]
+                val w = data[ 2 * numPredictions + i ]
+                val h = data[ 3 * numPredictions + i ]
+
+                val left = cx - w / 2f
+                val top = cy - h / 2f
+                
+                detections.add(
+                    SortTracker.Detection(
+                        RectF(left, top, left + w, top + h),
+                        classIdx,
+                        maxProb
+                    )
+                )
+            }
+        }
+        return detections
+    }
+
+    /**
+     * Parses End-to-End models (e.g. YOLOv10) which output [1, 300, 6].
+     * Data format: [x1, y1, x2, y2, score, class]
+     */
+    private fun parseEndToEndOutput(data: FloatArray): List<SortTracker.Detection> {
+        val detections = mutableListOf<SortTracker.Detection>()
+        val numDetections = 300
+        val elementsPerDetection = 6
+
+        for (i in 0 until numDetections) {
+            val offset = i * elementsPerDetection
+            val score = data[offset + 4]
+            val classIdx = data[offset + 5].toInt()
+            
+            if (i < 5) { // Log top 5 detections for debugging
+                AppLog.d("Top Detections [$i]: Class=$classIdx, Score=$score")
+            }
+
+            if (score > confidenceThreshold) {
+                val x1 = data[offset + 0]
+                val y1 = data[offset + 1]
+                val x2 = data[offset + 2]
+                val y2 = data[offset + 3]
+                
+                detections.add(
+                    SortTracker.Detection(
+                        RectF(x1, y1, x2, y2),
+                        classIdx,
+                        score
+                    )
+                )
+            }
+        }
+        return detections
+    }
+
+    private fun applyNMS(detections: List<SortTracker.Detection>): List<SortTracker.Detection> {
+        val sorted = detections.sortedByDescending { it.confidence }
+        val result = mutableListOf<SortTracker.Detection>()
+        val ignored = BooleanArray(sorted.size)
+
+        for (i in sorted.indices) {
+            if (ignored[i]) continue
+            val d1 = sorted[i]
+            result.add(d1)
+            for (j in i + 1 until sorted.size) {
+                if (ignored[j]) continue
+                val d2 = sorted[j]
+                if (calculateIoU(d1.bbox, d2.bbox) > nmsThreshold) {
+                    ignored[j] = true
+                }
+            }
+        }
+        return result
+    }
+
+    private fun calculateIoU(rect1: RectF, rect2: RectF): Float {
+        val intersection = RectF()
+        if (!intersection.setIntersect(rect1, rect2)) return 0f
+        val interArea = intersection.width() * intersection.height()
+        val unionArea = (rect1.width() * rect1.height()) + (rect2.width() * rect2.height()) - interArea
+        return if (unionArea > 0) interArea / unionArea else 0f
     }
 
     fun getLastInferenceTime(): Long = lastInferenceTime
 
-    private fun cropTemplate(bitmap: Bitmap, bbox: RectF): Bitmap {
-        val x = bbox.left.toInt().coerceIn(0, bitmap.width - 1)
-        val y = bbox.top.toInt().coerceIn(0, bitmap.height - 1)
-        val w = bbox.width().toInt().coerceIn(1, bitmap.width - x)
-        val h = bbox.height().toInt().coerceIn(1, bitmap.height - y)
-        return Bitmap.createBitmap(bitmap, x, y, w, h)
-    }
-
-    private fun mapResult(result: FloatArray, imgW: Int, imgH: Int, lastBbox: RectF): RectF {
-        if (result.size < 4) return lastBbox
-        
-        // AbaViTrack typically returns normalized [cx, cy, w, h] or [x, y, w, h] 
-        // relative to the search image size (256x256).
-        // Based on Python reference: cv.rectangle(frame_disp, (x, y), (x+w, y+h))
-        
-        val isNormalized = result.all { it <= 1.1f && it >= -0.1f }
-        val scaleX = if (isNormalized) imgW.toFloat() else imgW.toFloat() / 256f
-        val scaleY = if (isNormalized) imgH.toFloat() else imgH.toFloat() / 256f
-        
-        // If the values look like [center_x, center_y, width, height]
-        // result[0] and result[1] are often ~0.5 in the search window
-        val x: Float
-        val y: Float
-        val w: Float
-        val h: Float
-
-        // Heuristic: if it's AbaViTrack/Stark style, it might be [cx, cy, w, h] normalized
-        if (isNormalized && result[0] > 0.1 && result[1] > 0.1) {
-            // Try [cx, cy, w, h] to [x, y, w, h]
-            w = result[2] * scaleX
-            h = result[3] * scaleY
-            x = (result[0] * scaleX) - (w / 2f)
-            y = (result[1] * scaleY) - (h / 2f)
-        } else {
-            // Assume [x, y, w, h]
-            x = result[0] * scaleX
-            y = result[1] * scaleY
-            w = result[2] * scaleX
-            h = result[3] * scaleY
-        }
-        
-        return RectF(x, y, x + w, y + h)
-    }
-
     companion object {
-        private const val TAG = "ModelExecutor"
         @Throws(IOException::class)
         fun assetFilePath(context: Context, assetName: String): String {
             val file = File(context.filesDir, assetName)
@@ -205,3 +211,4 @@ class ModelExecutor(private val context: Context) {
         }
     }
 }
+
