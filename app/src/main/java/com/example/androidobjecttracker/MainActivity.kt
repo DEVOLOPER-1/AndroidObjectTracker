@@ -81,19 +81,17 @@ class MainActivity : ComponentActivity() {
         uri?.let { processVideo(it) }
     }
 
-    private val UNDERSAMPLING_FACTOR = 10 // Process 1 out of 10 frames (~3 fps)
-
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         
         modelExecutor = ModelExecutor(this)
         modelExecutor.loadModel("yolo26n.ptl")
         
-        sotExecutor = SOTExecutor(this)
-        sotExecutor.loadModel("AbaViTrack_lite.ptl")
+        sotExecutor = SOTExecutor()
+        sotExecutor.loadModel("AbaViTrack_lite.ptl", this)
         
-        videoProcessor = FastVideoProcessor(this, modelExecutor)
         videoEncoder = VideoEncoder(this)
+        videoProcessor = FastVideoProcessor(this, modelExecutor, sotExecutor, staticTracker, videoEncoder)
         
         cameraExecutor = Executors.newSingleThreadExecutor()
         previewView = PreviewView(this).apply {
@@ -106,7 +104,7 @@ class MainActivity : ComponentActivity() {
 
         setContent {
             val pins = staticTracker.getPins()
-            val carPath = staticTracker.getCarPath()
+            val carPath = sotExecutor.carPath
 
             TrackingScreen(
                 appState = appState,
@@ -139,7 +137,9 @@ class MainActivity : ComponentActivity() {
                     sotExecutor.reset()
                     staticTracker.reset()
                     trackedObjects = emptyList()
+                    val oldFrame = currentFrame
                     currentFrame = null
+                    oldFrame?.recycle()
                     processingProgress = 0f
                 }
             )
@@ -174,53 +174,19 @@ class MainActivity : ComponentActivity() {
             val startProcessingTime = System.currentTimeMillis()
             AppLog.d("Processing started at: $startProcessingTime")
             
-            var frameIndex = 0
-
             videoProcessor.processVideo(
                 uri = uri,
-                undersamplingFactor = UNDERSAMPLING_FACTOR,
                 onProgress = { progress, etaMs ->
                     processingProgress = progress
                     processingEtaMs = etaMs
                 },
-                onFrameProcessed = { frame, tracks ->
-                    if (frameIndex == 0) {
-                        // tracks are now in frame coordinates (1080p)
-                        staticTracker.initialize(tracks.map { SortTracker.Detection(it.bbox, it.classIndex, 1.0f) })
-                        
-                        if (useSot) {
-                            val car = tracks.find { it.classIndex == 0 || it.classIndex == 13 || it.classIndex == 2 }
-                            car?.let { 
-                                AppLog.i("Initializing SOT for car at ${it.bbox}")
-                                sotExecutor.init(frame, it.bbox) 
-                            }
-                        }
-                        
-                        videoEncoder.start(frame.width, frame.height, 30, UNDERSAMPLING_FACTOR)
-                    } else {
-                        // Hybrid Logic
-                        val detections = tracks.map { SortTracker.Detection(it.bbox, it.classIndex, 1.0f) }
-                        if (useSot) {
-                            val carBbox = sotExecutor.update(frame)
-                            staticTracker.update(detections, carBbox)
-                        } else {
-                            staticTracker.update(detections)
-                        }
-                    }
-
-                    // Map static objects for UI
-                    val pins = staticTracker.getPins()
-                    val carPath = staticTracker.getCarPath()
-                    
+                onFrameProcessed = { frame ->
+                    // UI needs current frame and updated states
                     val oldFrame = currentFrame
                     currentFrame = frame
-                    trackedObjects = emptyList() // Clear old tracks to prioritize static/SOT visuals
-                    
-                    // Incremental Encoding with Baked Annotations
-                    videoEncoder.addFrame(frame, pins, carPath)
-
-                    oldFrame?.recycle()
-                    frameIndex++
+                    if (oldFrame != null && oldFrame != frame) {
+                        oldFrame.recycle()
+                    }
                 }
             )
             

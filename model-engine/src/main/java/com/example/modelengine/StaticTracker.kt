@@ -1,112 +1,86 @@
 package com.example.modelengine
 
-import android.graphics.PointF
+import android.graphics.Bitmap
+import android.graphics.Color
 import android.graphics.RectF
-import kotlin.math.sqrt
+import kotlin.math.abs
 
 /**
- * A tracker that initializes object positions once and tracks state changes
- * based on Euclidean distance from the starting point.
+ * Tracks pin falls by comparing pixel data within static regions against a baseline intensity.
+ * This pivot avoids YOLO detection failures in static environments.
  */
 class StaticTracker {
-    
+
     data class PinState(
-        val initialCentroid: PointF,
-        var currentCentroid: PointF,
+        val id: Int,
+        val rect: RectF,
         var isFallen: Boolean = false,
-        var fallOrder: Int? = null
+        var fallOrder: Int? = null,
+        var baselineIntensity: Float = 0f,
     )
 
     private val pins = mutableListOf<PinState>()
-    private val carPath = mutableListOf<PointF>()
     private var nextFallOrder = 1
-    private val FALL_THRESHOLD = 50f // Pixels
-    private val CAR_MOVE_THRESHOLD = 5f
-
-    // Class Mappings based on logs
-    private val CAR_CLASSES = listOf(0, 13, 2)
-    private val PIN_CLASSES = listOf(1, 4, 7)
+    private val thresholdPinFall = 20.0f // Intensity change threshold for fall detection
 
     /**
-     * Call this on Frame 0 to lock the initial positions of the 5 pins and the car.
+     * Captures initial pixel intensity baselines for all pins on Frame 0.
      */
-    fun initialize(initialDetections: List<SortTracker.Detection>) {
+    fun initialize(frame: Bitmap, pinRects: List<RectF>) {
         pins.clear()
-        carPath.clear()
         nextFallOrder = 1
-
-        val detectedPins = initialDetections.filter { it.classIndex in PIN_CLASSES }
-        val detectedCar = initialDetections.find { it.classIndex in CAR_CLASSES }
-
-        detectedPins.take(5).forEach { pin ->
-            val center = PointF(pin.bbox.centerX(), pin.bbox.centerY())
-            pins.add(PinState(center, center))
-        }
-
-        detectedCar?.let { car ->
-            carPath.add(PointF(car.bbox.centerX(), car.bbox.centerY()))
-        }
         
-        AppLog.i("StaticTracker Initialized: ${pins.size} pins, Car found: ${detectedCar != null}")
+        pinRects.forEachIndexed { index, rect ->
+            val intensity = getAverageIntensity(frame, rect)
+            pins.add(PinState(id = index, rect = rect, baselineIntensity = intensity))
+        }
+        AppLog.i("StaticTracker: Pins initialized with pixel baselines")
     }
 
     /**
-     * Process a frame and update states based on distance.
+     * Compares current frame pixels against baselines to detect changes (falls).
      */
-    fun update(currentDetections: List<SortTracker.Detection>, externalCarBbox: RectF? = null) {
-        // 1. Update Pins
+    fun update(frame: Bitmap): List<PinState> {
         pins.forEach { pin ->
             if (!pin.isFallen) {
-                // Find the detection closest to the INITIAL centroid
-                val closest = currentDetections
-                    .filter { it.classIndex in PIN_CLASSES || it.classIndex == 2 } // 2 might be fallen pin in some models
-                    .minByOrNull { dist(it.bbox.centerX(), it.bbox.centerY(), pin.initialCentroid.x, pin.initialCentroid.y) }
-
-                closest?.let { det ->
-                    val curX = det.bbox.centerX()
-                    val curY = det.bbox.centerY()
-                    val distanceFromStart = dist(curX, curY, pin.initialCentroid.x, pin.initialCentroid.y)
-                    
-                    pin.currentCentroid = PointF(curX, curY)
-                    
-                    if (distanceFromStart > FALL_THRESHOLD) {
-                        pin.isFallen = true
-                        pin.fallOrder = nextFallOrder++
-                        AppLog.i("PIN FELL! Distance: $distanceFromStart, Order: ${pin.fallOrder}")
-                    }
-                }
-            }
-        }
-
-        // 2. Update Car Path
-        if (externalCarBbox != null) {
-            val newPoint = PointF(externalCarBbox.centerX(), externalCarBbox.centerY())
-            carPath.add(newPoint)
-            if (carPath.size > 200) carPath.removeAt(0)
-        } else {
-            val carDet = currentDetections.find { it.classIndex in CAR_CLASSES }
-            carDet?.let { det ->
-                val lastPoint = carPath.lastOrNull()
-                val newPoint = PointF(det.bbox.centerX(), det.bbox.centerY())
+                val currentIntensity = getAverageIntensity(frame, pin.rect)
+                val diff = abs(currentIntensity - pin.baselineIntensity)
                 
-                if (lastPoint == null || dist(newPoint.x, newPoint.y, lastPoint.x, lastPoint.y) > CAR_MOVE_THRESHOLD) {
-                    carPath.add(newPoint)
-                    if (carPath.size > 200) carPath.removeAt(0)
+                if (diff > thresholdPinFall) {
+                    pin.isFallen = true
+                    pin.fallOrder = nextFallOrder++
+                    AppLog.i("StaticTracker: Pin ${pin.id} fell (Baseline: ${pin.baselineIntensity}, Current: $currentIntensity, Diff: $diff)")
                 }
             }
         }
+        return pins
     }
 
-    fun getPins(): List<PinState> = pins.toList()
-    fun getCarPath(): List<PointF> = carPath.toList()
-
-    private fun dist(x1: Float, y1: Float, x2: Float, y2: Float): Float {
-        return sqrt(((x2 - x1) * (x2 - x1) + (y2 - y1) * (y2 - y1)).toDouble()).toFloat()
+    private fun getAverageIntensity(bitmap: Bitmap, rect: RectF): Float {
+        val left = rect.left.toInt().coerceIn(0, bitmap.width - 1)
+        val top = rect.top.toInt().coerceIn(0, bitmap.height - 1)
+        val right = rect.right.toInt().coerceIn(0, bitmap.width - 1)
+        val bottom = rect.bottom.toInt().coerceIn(0, bitmap.height - 1)
+        
+        val width = right - left
+        val height = bottom - top
+        if (width <= 0 || height <= 0) return 0f
+        
+        val pixels = IntArray(width * height)
+        bitmap.getPixels(pixels, 0, width, left, top, width, height)
+        
+        var total = 0L
+        for (p in pixels) {
+            // Simple grayscale conversion for intensity comparison
+            total += (Color.red(p) + Color.green(p) + Color.blue(p)) / 3
+        }
+        return total.toFloat() / (width * height)
     }
+
+    fun getPins() = pins.toList()
 
     fun reset() {
         pins.clear()
-        carPath.clear()
         nextFallOrder = 1
     }
 }

@@ -72,7 +72,7 @@ fun TrackingScreen(
                             }
                             pins.forEach { pin ->
                                 val color = if (pin.isFallen) Color.Red else Color.Green
-                                drawCircle(color, radius = 10.dp.toPx(), center = Offset(pin.currentCentroid.x, pin.currentCentroid.y))
+                                drawCircle(color, radius = 10.dp.toPx(), center = Offset(pin.rect.centerX(), pin.rect.centerY()))
                             }
                         }
                     }
@@ -231,7 +231,7 @@ fun ResultsView(
                 // Draw Pins
                 pins.forEach { pin ->
                     val color = if (pin.isFallen) Color.Red else Color.Green
-                    drawCircle(color, radius = 10.dp.toPx(), center = Offset(pin.currentCentroid.x, pin.currentCentroid.y))
+                    drawCircle(color, radius = 10.dp.toPx(), center = Offset(pin.rect.centerX(), pin.rect.centerY()))
                 }
             }
 
@@ -246,9 +246,9 @@ fun ResultsView(
                 // Pin Labels
                 pins.forEach { pin ->
                     if (pin.isFallen) {
-                        Label(text = "#${pin.fallOrder}", x = pin.currentCentroid.x, y = pin.currentCentroid.y, color = Color.Red)
+                        Label(text = "#${pin.fallOrder}", x = pin.rect.centerX(), y = pin.rect.centerY(), color = Color.Red)
                     } else {
-                        Label(text = "PIN", x = pin.currentCentroid.x, y = pin.currentCentroid.y - 40, color = Color.White)
+                        Label(text = "PIN", x = pin.rect.centerX(), y = pin.rect.centerY() - 40, color = Color.White)
                     }
                 }
             }
