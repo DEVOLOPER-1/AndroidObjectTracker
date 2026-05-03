@@ -25,8 +25,8 @@ class ModelExecutor(private val context: Context) {
     private val sortTracker = SortTracker()
 
     // YOLOv8 input dimensions
-    private val inputWidth = 640
-    private val inputHeight = 640
+    private val inputWidth = TrackingConfig.YOLO_INPUT_SIZE
+    private val inputHeight = TrackingConfig.YOLO_INPUT_SIZE
 
     // Confidence threshold for initial detections.
     // Lowered to 0.15 to capture small/distant pins.
@@ -123,23 +123,23 @@ class ModelExecutor(private val context: Context) {
     // -------------------------------------------------------------------------
 
     /**
-     * Parses standard YOLOv8 output shape [1, (4+numClasses), 8400].
-     * The tensor is stored in row-major order: data[row * 8400 + col].
+     * Parses standard YOLOv8 output shape [1, (4+numClasses), numPredictions].
      */
     private fun parseYoloOutput(data: FloatArray): List<SortTracker.Detection> {
+        // Common YOLOv8 prediction counts for 640x640 input (8400)
         val numPredictions = 8400
-        val expectedSize = (4 + numClasses) * numPredictions
-
-        if (data.size != expectedSize) {
-            AppLog.e("parseYoloOutput: size mismatch — expected $expectedSize, got ${data.size}. " +
-                     "Check numClasses (currently $numClasses).")
-            // Attempt a best-effort parse by inferring numClasses from actual data size
-            val inferredClasses = (data.size / numPredictions) - 4
-            if (inferredClasses < 1 || inferredClasses > 100) return emptyList()
-            return parseYoloOutputWithClasses(data, inferredClasses, numPredictions)
+        val actualClasses = (data.size / numPredictions) - 4
+        
+        if (actualClasses < 1 || actualClasses > 100) {
+            AppLog.e("parseYoloOutput: invalid data size ${data.size}")
+            return emptyList()
         }
 
-        return parseYoloOutputWithClasses(data, numClasses, numPredictions)
+        if (actualClasses != numClasses) {
+            AppLog.w("parseYoloOutput: inferred $actualClasses classes, but expected $numClasses. Adjusting.")
+        }
+
+        return parseYoloOutputWithClasses(data, actualClasses, numPredictions)
     }
 
     private fun parseYoloOutputWithClasses(

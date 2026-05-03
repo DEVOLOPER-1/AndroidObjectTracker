@@ -13,6 +13,7 @@ activityKtx = "1.8.0"
 constraintlayout = "2.1.4"
 kotlin = "2.0.0"
 pytorch = "2.1.0"
+chaquopy = "17.0.0"
 
 [libraries]
 androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "coreKtx" }
@@ -44,4 +45,5 @@ androidApp = { id = "com.android.application", version.ref = "agp" }
 androidLib = { id = "com.android.library", version.ref = "agp" }
 kotlinAndroid = { id = "org.jetbrains.kotlin.android", version.ref = "kotlin" }
 composeCompiler = { id = "org.jetbrains.kotlin.plugin.compose", version.ref = "kotlin" }
+chaquopy = { id = "com.chaquo.python", version.ref = "chaquopy" }
 

@@ -8,6 +8,8 @@ import android.graphics.Matrix
 import android.graphics.RectF
 import android.os.Bundle
 import android.provider.MediaStore
+import com.chaquo.python.Python
+import com.chaquo.python.android.AndroidPlatform
 import android.util.Log
 import android.util.Size
 import android.widget.Toast
@@ -81,6 +83,11 @@ class MainActivity : ComponentActivity() {
     // =========================================================================
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        // Initialize Python via Chaquopy
+        if (!Python.isStarted()) {
+            Python.start(AndroidPlatform(this))
+        }
 
         // Initialise ML
         modelExecutor = ModelExecutor(this).also { it.loadModel("yolo26n.ptl") }

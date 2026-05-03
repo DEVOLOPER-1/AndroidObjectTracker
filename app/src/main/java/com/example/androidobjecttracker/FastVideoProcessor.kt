@@ -88,6 +88,8 @@ class FastVideoProcessor(
 
             var isInitialized = false
             var framesProcessed = 0
+            var framesExtracted = 0
+            val skipFrames = TrackingConfig.skipFrames
             val startTime = System.currentTimeMillis()
 
             // ----------------------------------------------------------------
@@ -96,6 +98,14 @@ class FastVideoProcessor(
             while (true) {
                 val ptsUs = extractor.sampleTime
                 if (ptsUs < 0) break   // end of stream
+
+                // UNDERSAMPLING: Skip frames to improve processing speed
+                if (framesExtracted % (skipFrames + 1) != 0) {
+                    framesExtracted++
+                    extractor.advance()
+                    continue
+                }
+                framesExtracted++
 
                 // Retrieve the raw decoded frame for this PTS
                 val rawFrame = retriever.getFrameAtTime(ptsUs, MediaMetadataRetriever.OPTION_CLOSEST)
@@ -123,12 +133,12 @@ class FastVideoProcessor(
                         AppLog.d("FastVideoProcessor: Found ${detections.size} detections on Frame $framesProcessed")
                     }
 
-                    // Best car: highest-confidence Class-0 (custom) or Class-2 (COCO) detection
+                    // Best car: Class 0 (Custom) or COCO Classes: 2 (car), 3 (motorcycle), 5 (bus), 7 (truck)
                     val carDetection = detections
-                        .filter { it.classIndex == 0 || it.classIndex == 2 }
+                        .filter { it.classIndex == 0 || it.classIndex == 2 || it.classIndex == 3 || it.classIndex == 5 || it.classIndex == 7 }
                         .maxByOrNull { it.confidence }
 
-                    // All pin detections: Class 1, sorted by confidence, cap at 10
+                    // All pin detections: Class 1 (Custom). If no class 1, we look for similar small objects
                     val pinDetections = detections
                         .filter { it.classIndex == 1 }
                         .sortedByDescending { it.confidence }
@@ -137,7 +147,7 @@ class FastVideoProcessor(
                     // Hand off to specialist trackers
                     if (carDetection != null) {
                         sotExecutor.init(bitmap, carDetection.bbox)
-                        AppLog.i("FastVideoProcessor: Car bootstrapped — bbox=${carDetection.bbox}  conf=${carDetection.confidence} (class=${carDetection.classIndex})")
+                        AppLog.i("FastVideoProcessor: Car bootstrapped @ (${carDetection.bbox.centerX()}, ${carDetection.bbox.centerY()}) conf=${carDetection.confidence}")
                         
                         // Initialize pins if found, or log warning
                         if (pinDetections.isNotEmpty()) {
@@ -166,17 +176,19 @@ class FastVideoProcessor(
                     // -- Car: SOT --
                     val carBbox = sotExecutor.update(bitmap)
 
-                    // Draw accumulated trajectory path
+                    // Draw current car bounding box
+                    carBbox?.let { canvas.drawRect(it, carPaint) }
+
+                    // Car bounding path (trajectory including current box)
                     val path = sotExecutor.carPath
                     if (path.size > 1) {
                         val gfxPath = Path()
                         gfxPath.moveTo(path[0].x, path[0].y)
-                        for (i in 1 until path.size) gfxPath.lineTo(path[i].x, path[i].y)
+                        for (i in 1 until path.size) {
+                            gfxPath.lineTo(path[i].x, path[i].y)
+                        }
                         canvas.drawPath(gfxPath, carPaint)
                     }
-
-                    // Draw current car bounding box
-                    carBbox?.let { canvas.drawRect(it, carPaint) }
                 }
 
                 // ------------------------------------------------------------

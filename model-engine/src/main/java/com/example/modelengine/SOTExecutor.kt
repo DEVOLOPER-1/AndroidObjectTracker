@@ -4,12 +4,14 @@ import android.content.Context
 import android.graphics.*
 import org.pytorch.IValue
 import org.pytorch.Module
+import org.pytorch.PyTorchAndroid
 import org.pytorch.Tensor
 import org.pytorch.torchvision.TensorImageUtils
 import kotlin.math.cos
 import kotlin.math.exp
 import kotlin.math.max
 import kotlin.math.PI
+import kotlin.math.sqrt
 
 /**
  * High-precision Car Tracker using AbaViTrack (Vision Transformer SOT).
@@ -31,10 +33,10 @@ class SOTExecutor {
 
     private var module: Module? = null
 
-    // ---- AbaViTrack dimensions ----
-    private val templateSize = 128
-    private val searchSize   = 256
-    private val gridDim      = 16          // score map is gridDim × gridDim = 256 cells
+    // ---- AbaViTrack dimensions (patch16_224) ----
+    private val templateSize = TrackingConfig.AB_TEMPLATE_SIZE
+    private val searchSize   = TrackingConfig.AB_SEARCH_SIZE
+    private val gridDim      = 16          // default fallback grid dimension (16x16=256)
 
     // ---- Tracker state ----
     private var templateTensor: Tensor? = null
@@ -74,6 +76,10 @@ class SOTExecutor {
     // -------------------------------------------------------------------------
     fun loadModel(assetName: String, context: Context) {
         try {
+            val numThreads = max(1, Runtime.getRuntime().availableProcessors() - 1)
+            PyTorchAndroid.setNumThreads(numThreads)
+            AppLog.i("SOTExecutor: Using $numThreads CPU threads for inference")
+
             val path = ModelExecutor.assetFilePath(context, assetName)
             module = Module.load(path)
             AppLog.i("SOTExecutor: Model loaded — $assetName")
@@ -95,7 +101,7 @@ class SOTExecutor {
         carPath.clear()
         carPath.add(PointF(initialBox.centerX(), initialBox.centerY()))
 
-        // Build a square context region 2× the larger dimension of the box.
+        AppLog.i("SOTExecutor.init: Using templateSize=$templateSize, searchSize=$searchSize")
         // Using a square avoids distorting the template crop when the
         // YOLO box has a non-1:1 aspect ratio, preventing feature mismatch
         // between template and search patches.
@@ -153,23 +159,81 @@ class SOTExecutor {
             val outputTensors: Array<IValue> = when {
                 outputs.isTuple -> outputs.toTuple()
                 outputs.isList  -> outputs.toList()
-                else            -> emptyArray()
+                else            -> arrayOf(outputs)
             }
 
-            if (outputTensors.size < 2) {
-                AppLog.e("SOTExecutor.update: unexpected output count ${outputTensors.size}")
+            if (outputTensors.isEmpty()) {
+                AppLog.e("SOTExecutor.update: no output tensors returned")
                 return lastBbox
             }
 
+            // Diagnostic: Log shapes of output tensors (only on first few frames)
+            if (carPath.size < 5) {
+                val shapes = outputTensors.map { it.toTensor().shape().contentToString() }
+                AppLog.d("SOTExecutor.update: output shapes = $shapes")
+            }
+
+            var dx = 0f
+            var dy = 0f
+            var wNorm = 0f
+            var hNorm = 0f
+            var probability = 0f
+            var row = 0
+            var col = 0
+            var currentGridDim = 16
+
+            // Determine model output style
+            // Diagnostic check for [1, 1, 4] style (common in some exports)
+            val firstShape = outputTensors[0].toTensor().shape()
+            if (firstShape.contentEquals(longArrayOf(1, 1, 4)) || firstShape.contentEquals(longArrayOf(1, 4))) {
+                // Style D: Direct normalized bbox [x1, y1, x2, y2] relative to search crop
+                val bboxArr = outputTensors[0].toTensor().dataAsFloatArray
+                val x1 = bboxArr[0]; val y1 = bboxArr[1]; val x2 = bboxArr[2]; val y2 = bboxArr[3]
+                
+                // Map from [0,1] search-crop space to full-frame space
+                val cxNorm = (x1 + x2) / 2f
+                val cyNorm = (y1 + y2) / 2f
+                val wNorm  = x2 - x1
+                val hNorm  = y2 - y1
+                
+                val cxFull = searchRegion.left + cxNorm * searchRegion.width()
+                val cyFull = searchRegion.top  + cyNorm * searchRegion.height()
+                val wFull  = wNorm * searchRegion.width()
+                val hFull  = hNorm * searchRegion.height()
+                
+                lastBbox = RectF(cxFull - wFull / 2, cyFull - hFull / 2,
+                                 cxFull + wFull / 2, cyFull + hFull / 2)
+                carPath.add(PointF(cxFull, cyFull))
+                
+                // If there's a second tensor, it's usually the confidence/score map
+                var prob = 0.9f 
+                if (outputTensors.size > 1) {
+                    val confData = outputTensors[1].toTensor().dataAsFloatArray
+                    if (confData.isNotEmpty()) {
+                        val maxConf = confData.maxOrNull() ?: 0f
+                        prob = 1f / (1f + exp(-maxConf))
+                    }
+                }
+                
+                AppLog.d("SOTExecutor.update: tracked (Direct) @ (%.1f, %.1f) prob=%.3f".format(cxFull, cyFull, prob))
+                return lastBbox
+            }
+
+            // Heatmap-based logic (Styles A, B, C)
             val scoreMap = outputTensors[0].toTensor()
             val scores   = scoreMap.dataAsFloatArray
+            val scoreCount = scores.size
+            currentGridDim = sqrt(scoreCount.toDouble()).toInt()
+            val spatialSize = currentGridDim * currentGridDim
 
             // ------------------------------------------------------------------
-            // 4. Apply Hanning Window BEFORE argmax.
+            // 4. Apply Hanning Window (Mixed with flat window to reduce "center-stuck" bias)
             // ------------------------------------------------------------------
             val windowSize = minOf(scores.size, hanningWindow.size)
+            val alpha = 0.4f // 40% influence from Hanning, 60% raw scores
             val windowedScores = FloatArray(scores.size) { i ->
-                if (i < windowSize) scores[i] * hanningWindow[i] else scores[i]
+                val weight = if (i < windowSize) (1f - alpha) + alpha * hanningWindow[i] else 1f
+                scores[i] * weight
             }
 
             var bestIdx  = 0
@@ -181,36 +245,19 @@ class SOTExecutor {
                 }
             }
 
-            // ------------------------------------------------------------------
-            // 5. Sigmoid normalisation for confidence check.
-            // ------------------------------------------------------------------
-            val rawScore    = scores[bestIdx]
-            val probability = 1f / (1f + exp(-rawScore))
+            val rawScore = scores[bestIdx]
+            probability = 1f / (1f + exp(-rawScore))
 
             if (probability < confidenceThreshold) {
                 AppLog.d("SOTExecutor.update: low confidence (prob=${"%.3f".format(probability)}) — holding position")
                 return lastBbox
             }
 
-            // ------------------------------------------------------------------
-            // 6. Map predicted coordinates from search-crop space → full frame.
-            // ------------------------------------------------------------------
-            // Dynamically determine the grid dimension from the actual output size
-            // (Standard is 16x16=256, but lite models may differ)
-            val scoreCount     = scores.size
-            val currentGridDim = kotlin.math.sqrt(scoreCount.toDouble()).toInt()
-            val spatialSize    = currentGridDim * currentGridDim
-
-            val row = bestIdx / currentGridDim
-            val col = bestIdx % currentGridDim
-
-            val dx: Float
-            val dy: Float
-            val wNorm: Float
-            val hNorm: Float
+            row = bestIdx / currentGridDim
+            col = bestIdx % currentGridDim
 
             when {
-                // Case A: (score, w, h, dx, dy) — 5 separate tensors (AbaViTrack lite variant)
+                // Case A: (score, w, h, dx, dy)
                 outputTensors.size >= 5 -> {
                     val wMap  = outputTensors[1].toTensor().dataAsFloatArray
                     val hMap  = outputTensors[2].toTensor().dataAsFloatArray
@@ -221,17 +268,17 @@ class SOTExecutor {
                     wNorm = if (bestIdx < wMap.size)  wMap[bestIdx]  else 0f
                     hNorm = if (bestIdx < hMap.size)  hMap[bestIdx]  else 0f
                 }
-                // Case B: (score, size, offset) — 3 tensors, each with 2 stacked maps
+                // Case B: (score, size, offset)
                 outputTensors.size >= 3 -> {
                     val sizes   = outputTensors[1].toTensor().dataAsFloatArray
                     val offsets = outputTensors[2].toTensor().dataAsFloatArray
-                    dx    = if (bestIdx < offsets.size) offsets[bestIdx] else 0f
-                    dy    = if (spatialSize + bestIdx < offsets.size) offsets[spatialSize + bestIdx] else 0f
                     wNorm = if (bestIdx < sizes.size) sizes[bestIdx] else 0f
                     hNorm = if (spatialSize + bestIdx < sizes.size) sizes[spatialSize + bestIdx] else 0f
+                    dx    = if (bestIdx < offsets.size) offsets[bestIdx] else 0f
+                    dy    = if (spatialSize + bestIdx < offsets.size) offsets[spatialSize + bestIdx] else 0f
                 }
-                // Case C: (score, bbox) — 2 tensors, second has all 4 stacked maps [x, y, w, h]
-                else -> {
+                // Case C: (score, bbox)
+                outputTensors.size >= 2 -> {
                     val bboxes = outputTensors[1].toTensor().dataAsFloatArray
                     dx    = if (0 * spatialSize + bestIdx < bboxes.size) bboxes[0 * spatialSize + bestIdx] else 0f
                     dy    = if (1 * spatialSize + bestIdx < bboxes.size) bboxes[1 * spatialSize + bestIdx] else 0f
