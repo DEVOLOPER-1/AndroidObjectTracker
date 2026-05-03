@@ -28,6 +28,14 @@ object AppLog {
         }
     }
 
+    fun w(message: String) {
+        if (isEnabled) {
+            val fullMsg = "$PREFIX[WARN] $message"
+            Log.w(TAG, fullMsg)
+            println(fullMsg)
+        }
+    }
+
     fun e(message: String, throwable: Throwable? = null) {
         val fullMsg = "$PREFIX[ERROR] $message"
         Log.e(TAG, fullMsg, throwable)

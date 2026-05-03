@@ -23,6 +23,8 @@ class VideoEncoder(private val context: Context) {
     private var trackIndex = -1
     private var outFile: File? = null
     private val ptsQueue = java.util.ArrayDeque<Long>()
+    private var firstPts = -1L
+    private var lastSentPts = -1L
 
     /**
      * Initializes the encoder. framerate is a baseline, but actual speed is controlled by PTS.
@@ -30,6 +32,8 @@ class VideoEncoder(private val context: Context) {
     fun start(width: Int, height: Int, fps: Int = 30) {
         val fileName = "Annotated_${System.currentTimeMillis()}.mp4"
         outFile = File(context.cacheDir, fileName)
+        firstPts = -1L
+        lastSentPts = -1L
         
         val mime = MediaFormat.MIMETYPE_VIDEO_AVC
         val format = MediaFormat.createVideoFormat(mime, width, height)
@@ -93,26 +97,54 @@ class VideoEncoder(private val context: Context) {
             if (status == MediaCodec.INFO_TRY_AGAIN_LATER) {
                 if (!endOfStream) break
             } else if (status == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
-                trackIndex = muxer!!.addTrack(codec.outputFormat)
-                muxer!!.start()
-                muxerStarted = true
+                if (muxerStarted) {
+                    AppLog.w("VideoEncoder: Format changed twice, ignoring")
+                } else {
+                    trackIndex = muxer!!.addTrack(codec.outputFormat)
+                    muxer!!.start()
+                    muxerStarted = true
+                    AppLog.i("VideoEncoder: Muxer started with track index $trackIndex")
+                }
             } else if (status >= 0) {
                 val encodedData = codec.getOutputBuffer(status) ?: break
-                if (bufferInfo.size != 0 && muxerStarted && trackIndex >= 0) {
+                
+                // 1. Identify if this is a real data frame or just codec config
+                val isConfig = (bufferInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0
+
+                // 2. Match output buffer with its original PTS from the queue ONLY for data frames
+                if (!isConfig) {
+                    val polledPts = ptsQueue.poll()
+                    
+                    // Fallback to a synthetic PTS if the queue is empty (prevents massive system-time jumps)
+                    val effectivePts = if (polledPts != null) {
+                        polledPts
+                    } else {
+                        AppLog.w("VideoEncoder: ptsQueue empty! Using synthetic timestamp.")
+                        if (firstPts == -1L) 0L else firstPts + lastSentPts + 33333
+                    }
+
+                    // Normalize timestamps to start at 0
+                    if (firstPts == -1L) firstPts = effectivePts
+                    val normalizedPts = effectivePts - firstPts
+                    
+                    // Ensure strictly increasing timestamps (MediaMuxer requirement)
+                    bufferInfo.presentationTimeUs = if (normalizedPts > lastSentPts) {
+                        normalizedPts
+                    } else {
+                        lastSentPts + 1000 // force a small advance if duplicate or backward
+                    }
+                    lastSentPts = bufferInfo.presentationTimeUs
+                }
+
+                if (bufferInfo.size != 0 && muxerStarted && trackIndex >= 0 && !isConfig) {
                     encodedData.position(bufferInfo.offset)
                     encodedData.limit(bufferInfo.offset + bufferInfo.size)
-                    
-                    // CRITICAL FIX: Match output buffer with its original PTS from the queue
-                    // This handles encoder latency (e.g. B-frame reordering or internal buffering)
-                    val pts = ptsQueue.poll()
-                    if (pts != null) {
-                        bufferInfo.presentationTimeUs = pts
-                    }
                     
                     try {
                         muxer!!.writeSampleData(trackIndex, encodedData, bufferInfo)
                     } catch (e: Exception) {
-                        AppLog.e("VideoEncoder: Failed to write sample data", e)
+                        // Log more details to help debugging
+                        AppLog.e("VideoEncoder: Failed to write sample data. track=$trackIndex, size=${bufferInfo.size}, pts=${bufferInfo.presentationTimeUs}", e)
                     }
                 }
                 codec.releaseOutputBuffer(status, false)

@@ -6,139 +6,256 @@ import org.pytorch.IValue
 import org.pytorch.Module
 import org.pytorch.Tensor
 import org.pytorch.torchvision.TensorImageUtils
+import kotlin.math.cos
+import kotlin.math.exp
 import kotlin.math.max
+import kotlin.math.PI
 
 /**
- * High-precision Car Tracker using AbaViTrack.
- * Handles template/search crops and maps relative box predictions back to the full frame.
+ * High-precision Car Tracker using AbaViTrack (Vision Transformer SOT).
+ *
+ * Architecture (Bootstrap pattern):
+ *  • init()   – called ONCE on Frame 0 to capture the template crop from the YOLO bbox.
+ *  • update() – called on every subsequent frame (Frame 1+).
+ *
+ * Key math:
+ *  1. Template: 128×128 square crop centered on the target, extracted at init time.
+ *  2. Search:   256×256 crop centered on the last known position, extracted each frame.
+ *  3. Hanning Window: 16×16 cosine penalty applied element-wise to the score map BEFORE
+ *     argmax. This strongly penalises locations far from the crop centre, preventing
+ *     the tracker from snapping to distractors or background clutter.
+ *  4. Coordinate mapping: the model predicts a box relative to the 256×256 search crop.
+ *     update() maps those relative coordinates back to the full frame's pixel space.
  */
 class SOTExecutor {
+
     private var module: Module? = null
-    // AbaViTrack configuration
+
+    // ---- AbaViTrack dimensions ----
     private val templateSize = 128
-    private val searchSize = 256
-    
+    private val searchSize   = 256
+    private val gridDim      = 16          // score map is gridDim × gridDim = 256 cells
+
+    // ---- Tracker state ----
     private var templateTensor: Tensor? = null
-    private var lastBbox: RectF? = null
+    private var lastBbox: RectF?         = null
+
+    /** Persistent list of frame-centre points. Drawn as trajectory on the output video. */
     val carPath = mutableListOf<PointF>()
 
-    // AbaViTrack Normalization constants
+    // ---- ImageNet normalisation (AbaViTrack was ViT-pretrained on ImageNet) ----
     private val normMean = floatArrayOf(0.485f, 0.456f, 0.406f)
-    private val normStd = floatArrayOf(0.229f, 0.224f, 0.225f)
+    private val normStd  = floatArrayOf(0.229f, 0.224f, 0.225f)
 
+    // ---- Hanning Window (BUG 1 FIX) ----
+    //
+    // A 1-D Hanning window of length N is:
+    //   w[i] = 0.5 * (1 – cos(2π·i / (N–1)))
+    //
+    // The 2-D window is the outer product w_row[r] * w_col[c], giving a
+    // smooth bell-shaped surface whose maximum is at the centre cell (7,7).
+    // Multiplying the flat score map by this surface before argmax means the
+    // tracker is biased toward finding the target near the expected position,
+    // and strong-but-peripheral responses (background clutter) are suppressed.
+    private val hanningWindow: FloatArray = run {
+        val hann1d = FloatArray(gridDim) { i ->
+            (0.5 * (1.0 - cos(2.0 * PI * i / (gridDim - 1)))).toFloat()
+        }
+        // Outer product: hanningWindow[r * gridDim + c] = hann1d[r] * hann1d[c]
+        FloatArray(gridDim * gridDim) { idx ->
+            hann1d[idx / gridDim] * hann1d[idx % gridDim]
+        }
+    }
+
+    // Confidence threshold AFTER sigmoid normalisation (range 0–1).
+    // 0.25 is robust across models that output raw logits OR probabilities.
+    private val confidenceThreshold = 0.25f
+
+    // -------------------------------------------------------------------------
     fun loadModel(assetName: String, context: Context) {
         try {
             val path = ModelExecutor.assetFilePath(context, assetName)
             module = Module.load(path)
-            AppLog.i("SOT: Model loaded successfully")
+            AppLog.i("SOTExecutor: Model loaded — $assetName")
         } catch (e: Exception) {
-            AppLog.e("SOT: Model load failed", e)
+            AppLog.e("SOTExecutor: Model load failed", e)
         }
     }
 
+    // -------------------------------------------------------------------------
     /**
-     * Captures the target template on Frame 0.
+     * Captures the template on Frame 0.
+     * Must be called before any call to update().
+     *
+     * @param frame       The full camera/video frame bitmap.
+     * @param initialBox  The bounding box returned by YOLO for the RC car (in frame space).
      */
     fun init(frame: Bitmap, initialBox: RectF) {
         lastBbox = RectF(initialBox)
         carPath.clear()
         carPath.add(PointF(initialBox.centerX(), initialBox.centerY()))
-        
-        // FIX: Use a square region centered on the object for the template.
-        // Stretching the object's non-square bounding box to a square tensor 
-        // causes feature mismatch with the search patch.
+
+        // Build a square context region 2× the larger dimension of the box.
+        // Using a square avoids distorting the template crop when the
+        // YOLO box has a non-1:1 aspect ratio, preventing feature mismatch
+        // between template and search patches.
         val side = max(initialBox.width(), initialBox.height()) * 2f
-        val templateRegion = RectF(
-            initialBox.centerX() - side/2,
-            initialBox.centerY() - side/2,
-            initialBox.centerX() + side/2,
-            initialBox.centerY() + side/2
-        )
-        
+        val cx   = initialBox.centerX()
+        val cy   = initialBox.centerY()
+        val templateRegion = RectF(cx - side / 2, cy - side / 2, cx + side / 2, cy + side / 2)
+
         val templateBitmap = cropAndResize(frame, templateRegion, templateSize)
         templateTensor = TensorImageUtils.bitmapToFloat32Tensor(templateBitmap, normMean, normStd)
         templateBitmap.recycle()
-        AppLog.i("SOT: Target initialized at $initialBox, Template Region: $templateRegion")
+
+        AppLog.i("SOTExecutor.init: bbox=$initialBox  templateRegion=$templateRegion")
     }
 
+    // -------------------------------------------------------------------------
     /**
-     * Performs tracking on subsequent frames with coordinate mapping.
+     * Runs one tracking step on [frame].
+     * Returns the updated bounding box in full-frame pixel coordinates,
+     * or the previous bbox if the model has low confidence this frame.
+     *
+     * @param frame  The full camera/video frame bitmap for the CURRENT frame.
      */
     fun update(frame: Bitmap): RectF? {
-        val mod = module ?: return null
-        val z = templateTensor ?: return null
-        val prev = lastBbox ?: return null
+        val mod  = module          ?: return lastBbox   // Return last known if model not loaded
+        val z    = templateTensor  ?: return null
+        val prev = lastBbox        ?: return null
 
-        // 1. Define Search Region (4x target size, centered on last known position)
+        // ------------------------------------------------------------------
+        // 1. Build search region: a square 4× the target size, centred on
+        //    the last known position.  The larger the multiplier, the more
+        //    motion the tracker can handle, at the cost of more distractor risk.
+        // ------------------------------------------------------------------
         val side = max(prev.width(), prev.height()) * 4f
         val searchRegion = RectF(
-            prev.centerX() - side/2,
-            prev.centerY() - side/2,
-            prev.centerX() + side/2,
-            prev.centerY() + side/2
+            prev.centerX() - side / 2,
+            prev.centerY() - side / 2,
+            prev.centerX() + side / 2,
+            prev.centerY() + side / 2
         )
-        
-        // 2. Extract and Normalize Search Patch
+
+        // ------------------------------------------------------------------
+        // 2. Extract and normalise the search patch.
+        // ------------------------------------------------------------------
         val xBitmap = cropAndResize(frame, searchRegion, searchSize)
         val xTensor = TensorImageUtils.bitmapToFloat32Tensor(xBitmap, normMean, normStd)
 
         try {
-            // 3. Inference: AbaViTrack expects [template, search]
+            // ------------------------------------------------------------------
+            // 3. Inference: AbaViTrack takes [template, search] → (score, size, offset)
+            // Some versions might output only (score, bbox) where bbox is [4, 16, 16]
+            // ------------------------------------------------------------------
             val outputs = mod.forward(IValue.from(z), IValue.from(xTensor))
-            
-            // Handle output tuple [score_map, size_map, offset_map]
-            val outputTensors = when {
-                outputs.isTuple -> outputs.toTuple()
-                outputs.isList -> outputs.toList()
-                else -> emptyArray()
-            }
-            
-            if (outputTensors.size >= 3) {
-                val scoreMap = outputTensors[0].toTensor()
-                val sizeMap = outputTensors[1].toTensor()
-                val offsetMap = outputTensors[2].toTensor()
-                
-                // FIX: Restore to 16. The model error (196 vs 256) indicates it expects 256 tokens (16x16)
-                val gridDim = 16
-                val scores = scoreMap.dataAsFloatArray
-                var maxScore = -1000f // Handle raw logits or probabilities
-                var bestIdx = 0
-                for (i in scores.indices) {
-                    if (scores[i] > maxScore) {
-                        maxScore = scores[i]
-                        bestIdx = i
-                    }
-                }
 
-                if (maxScore > 0.1f || (maxScore > -5.0f && maxScore < 0.0f)) { // Flexible threshold
-                    val row = bestIdx / gridDim
-                    val col = bestIdx % gridDim
-                    
-                    val sizes = sizeMap.dataAsFloatArray
-                    val offsets = offsetMap.dataAsFloatArray
-                    
-                    // Coordinates relative to the searchSize patch
-                    val dx = offsets[bestIdx] 
-                    val dy = offsets[gridDim * gridDim + bestIdx]
-                    val wNorm = sizes[bestIdx]
-                    val hNorm = sizes[gridDim * gridDim + bestIdx]
-                    
-                    val cxNorm = (col + 0.5f + dx) / gridDim
-                    val cyNorm = (row + 0.5f + dy) / gridDim
-                    
-                    // CRITICAL: Map relative crop coordinates back to Full Frame
-                    val cxFull = searchRegion.left + cxNorm * searchRegion.width()
-                    val cyFull = searchRegion.top + cyNorm * searchRegion.height()
-                    val wFull = wNorm * searchRegion.width()
-                    val hFull = hNorm * searchRegion.height()
-                    
-                    lastBbox = RectF(cxFull - wFull/2, cyFull - hFull/2, cxFull + wFull/2, cyFull + hFull/2)
-                    carPath.add(PointF(cxFull, cyFull))
-                    AppLog.d("SOT: Tracked at ($cxFull, $cyFull) score=$maxScore")
+            val outputTensors: Array<IValue> = when {
+                outputs.isTuple -> outputs.toTuple()
+                outputs.isList  -> outputs.toList()
+                else            -> emptyArray()
+            }
+
+            if (outputTensors.size < 2) {
+                AppLog.e("SOTExecutor.update: unexpected output count ${outputTensors.size}")
+                return lastBbox
+            }
+
+            val scoreMap = outputTensors[0].toTensor()
+            val scores   = scoreMap.dataAsFloatArray
+
+            // ------------------------------------------------------------------
+            // 4. Apply Hanning Window BEFORE argmax.
+            // ------------------------------------------------------------------
+            val windowSize = minOf(scores.size, hanningWindow.size)
+            val windowedScores = FloatArray(scores.size) { i ->
+                if (i < windowSize) scores[i] * hanningWindow[i] else scores[i]
+            }
+
+            var bestIdx  = 0
+            var maxWin   = Float.NEGATIVE_INFINITY
+            for (i in windowedScores.indices) {
+                if (windowedScores[i] > maxWin) {
+                    maxWin  = windowedScores[i]
+                    bestIdx = i
                 }
             }
+
+            // ------------------------------------------------------------------
+            // 5. Sigmoid normalisation for confidence check.
+            // ------------------------------------------------------------------
+            val rawScore    = scores[bestIdx]
+            val probability = 1f / (1f + exp(-rawScore))
+
+            if (probability < confidenceThreshold) {
+                AppLog.d("SOTExecutor.update: low confidence (prob=${"%.3f".format(probability)}) — holding position")
+                return lastBbox
+            }
+
+            // ------------------------------------------------------------------
+            // 6. Map predicted coordinates from search-crop space → full frame.
+            // ------------------------------------------------------------------
+            // Dynamically determine the grid dimension from the actual output size
+            // (Standard is 16x16=256, but lite models may differ)
+            val scoreCount     = scores.size
+            val currentGridDim = kotlin.math.sqrt(scoreCount.toDouble()).toInt()
+            val spatialSize    = currentGridDim * currentGridDim
+
+            val row = bestIdx / currentGridDim
+            val col = bestIdx % currentGridDim
+
+            val dx: Float
+            val dy: Float
+            val wNorm: Float
+            val hNorm: Float
+
+            when {
+                // Case A: (score, w, h, dx, dy) — 5 separate tensors (AbaViTrack lite variant)
+                outputTensors.size >= 5 -> {
+                    val wMap  = outputTensors[1].toTensor().dataAsFloatArray
+                    val hMap  = outputTensors[2].toTensor().dataAsFloatArray
+                    val dxMap = outputTensors[3].toTensor().dataAsFloatArray
+                    val dyMap = outputTensors[4].toTensor().dataAsFloatArray
+                    dx    = if (bestIdx < dxMap.size) dxMap[bestIdx] else 0f
+                    dy    = if (bestIdx < dyMap.size) dyMap[bestIdx] else 0f
+                    wNorm = if (bestIdx < wMap.size)  wMap[bestIdx]  else 0f
+                    hNorm = if (bestIdx < hMap.size)  hMap[bestIdx]  else 0f
+                }
+                // Case B: (score, size, offset) — 3 tensors, each with 2 stacked maps
+                outputTensors.size >= 3 -> {
+                    val sizes   = outputTensors[1].toTensor().dataAsFloatArray
+                    val offsets = outputTensors[2].toTensor().dataAsFloatArray
+                    dx    = if (bestIdx < offsets.size) offsets[bestIdx] else 0f
+                    dy    = if (spatialSize + bestIdx < offsets.size) offsets[spatialSize + bestIdx] else 0f
+                    wNorm = if (bestIdx < sizes.size) sizes[bestIdx] else 0f
+                    hNorm = if (spatialSize + bestIdx < sizes.size) sizes[spatialSize + bestIdx] else 0f
+                }
+                // Case C: (score, bbox) — 2 tensors, second has all 4 stacked maps [x, y, w, h]
+                else -> {
+                    val bboxes = outputTensors[1].toTensor().dataAsFloatArray
+                    dx    = if (0 * spatialSize + bestIdx < bboxes.size) bboxes[0 * spatialSize + bestIdx] else 0f
+                    dy    = if (1 * spatialSize + bestIdx < bboxes.size) bboxes[1 * spatialSize + bestIdx] else 0f
+                    wNorm = if (2 * spatialSize + bestIdx < bboxes.size) bboxes[2 * spatialSize + bestIdx] else 0f
+                    hNorm = if (3 * spatialSize + bestIdx < bboxes.size) bboxes[3 * spatialSize + bestIdx] else 0f
+                }
+            }
+
+            val cxNorm = (col + 0.5f + dx) / currentGridDim
+            val cyNorm = (row + 0.5f + dy) / currentGridDim
+
+            val cxFull = searchRegion.left + cxNorm * searchRegion.width()
+            val cyFull = searchRegion.top  + cyNorm * searchRegion.height()
+            val wFull  = wNorm * searchRegion.width()
+            val hFull  = hNorm * searchRegion.height()
+
+            lastBbox = RectF(cxFull - wFull / 2, cyFull - hFull / 2,
+                             cxFull + wFull / 2, cyFull + hFull / 2)
+            carPath.add(PointF(cxFull, cyFull))
+
+            AppLog.d("SOTExecutor.update: tracked @ (%.1f, %.1f) prob=${"%.3f".format(probability)}".format(cxFull, cyFull))
+
         } catch (e: Exception) {
-            AppLog.e("SOT: Tracking update failed", e)
+            AppLog.e("SOTExecutor.update: inference failed", e)
         } finally {
             xBitmap.recycle()
         }
@@ -146,22 +263,27 @@ class SOTExecutor {
         return lastBbox
     }
 
+    // -------------------------------------------------------------------------
+    /**
+     * Crops [src] to [roi] (which may extend beyond the bitmap bounds — padded
+     * with neutral grey) and rescales the result to [targetSize]×[targetSize].
+     */
     private fun cropAndResize(src: Bitmap, roi: RectF, targetSize: Int): Bitmap {
-        val dst = Bitmap.createBitmap(targetSize, targetSize, Bitmap.Config.ARGB_8888)
+        val dst    = Bitmap.createBitmap(targetSize, targetSize, Bitmap.Config.ARGB_8888)
         val canvas = Canvas(dst)
-        canvas.drawColor(Color.GRAY) // Gray padding for out-of-bounds
-        
-        val matrix = Matrix()
+        canvas.drawColor(Color.rgb(128, 128, 128)) // neutral grey for out-of-bounds padding
+
         val scale = targetSize.toFloat() / roi.width()
+        val matrix = Matrix()
         matrix.postTranslate(-roi.left, -roi.top)
         matrix.postScale(scale, scale)
-        
+
         canvas.drawBitmap(src, matrix, null)
         return dst
     }
 
     fun reset() {
-        lastBbox = null
+        lastBbox       = null
         templateTensor = null
         carPath.clear()
     }

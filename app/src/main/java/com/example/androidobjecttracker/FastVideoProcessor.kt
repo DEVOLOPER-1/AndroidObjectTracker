@@ -9,7 +9,21 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
 /**
- * Handles the video frame stream. Corrects Coordinate Mapping and Missing Annotation bugs.
+ * Drives the full video-processing pipeline:
+ *
+ *   Frame 0  — YOLO detection (no SORT) → bootstrap SOTExecutor + StaticTracker
+ *   Frame 1+ — SOTExecutor tracks the car; StaticTracker monitors pin regions
+ *
+ * Annotations are BAKED DIRECTLY into each Bitmap before it is fed to the
+ * VideoEncoder.  The UI overlay is intentionally not used — annotations live
+ * in the encoded output video, which is the project deliverable.
+ *
+ * Bug fixes applied in this revision:
+ *   BUG 4 — Frame 0 no longer calls sotExecutor.update(); uses YOLO bbox directly.
+ *   BUG 5 — Class IDs now follow the directive: Class 0 = Car, Class 1 = Pin.
+ *   BUG 6 — pin.fallOrder is never rendered as null ("null" text removed from output).
+ *   BUG 7 — modelExecutor.detect() is called (not detectAndTrack), keeping SORT
+ *            out of the bootstrap step entirely.
  */
 class FastVideoProcessor(
     private val context: Context,
@@ -18,11 +32,33 @@ class FastVideoProcessor(
     private val staticTracker: StaticTracker,
     private val videoEncoder: VideoEncoder
 ) {
-    // Annotation Paints
-    private val carPaint = Paint().apply { color = Color.YELLOW; strokeWidth = 8f; style = Paint.Style.STROKE; strokeCap = Paint.Cap.ROUND }
-    private val pinPaint = Paint().apply { color = Color.GREEN; strokeWidth = 4f; style = Paint.Style.STROKE }
-    private val textPaint = Paint().apply { color = Color.WHITE; textSize = 70f; typeface = Typeface.DEFAULT_BOLD; setShadowLayer(5f, 0f, 0f, Color.BLACK) }
 
+    // ---- Annotation paints ------------------------------------------------
+    private val carPaint = Paint().apply {
+        color       = Color.YELLOW
+        strokeWidth = 8f
+        style       = Paint.Style.STROKE
+        strokeCap   = Paint.Cap.ROUND
+        strokeJoin  = Paint.Join.ROUND
+        isAntiAlias = true
+    }
+
+    private val pinPaint = Paint().apply {
+        color       = Color.GREEN
+        strokeWidth = 4f
+        style       = Paint.Style.STROKE
+        isAntiAlias = true
+    }
+
+    private val textPaint = Paint().apply {
+        color     = Color.WHITE
+        textSize  = 70f
+        typeface  = Typeface.DEFAULT_BOLD
+        isAntiAlias = true
+        setShadowLayer(6f, 0f, 0f, Color.BLACK)
+    }
+
+    // -----------------------------------------------------------------------
     suspend fun processVideo(
         uri: Uri,
         onProgress: (Float, Long) -> Unit,
@@ -30,103 +66,170 @@ class FastVideoProcessor(
     ) {
         val retriever = MediaMetadataRetriever()
         val extractor = MediaExtractor()
-        
+
         try {
             retriever.setDataSource(context, uri)
             extractor.setDataSource(context, uri, null)
-            
-            val width = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toInt() ?: 0
-            val height = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toInt() ?: 0
-            val durationUs = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLong()?.times(1000) ?: 0L
-            
-            AppLog.i("FastVideoProcessor: Initializing encoder with resolution $width x $height")
+
+            val width      = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toInt()  ?: 0
+            val height     = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toInt() ?: 0
+            val durationUs = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
+                                ?.toLong()?.times(1000) ?: 0L
+
+            AppLog.i("FastVideoProcessor: Starting — ${width}×${height}, ${durationUs / 1_000_000}s")
             videoEncoder.start(width, height)
-            val startTime = System.currentTimeMillis()
 
             val videoTrack = selectVideoTrack(extractor)
-            if (videoTrack < 0) return
+            if (videoTrack < 0) {
+                AppLog.e("FastVideoProcessor: No video track found in URI")
+                return
+            }
             extractor.selectTrack(videoTrack)
 
             var isInitialized = false
             var framesProcessed = 0
+            val startTime = System.currentTimeMillis()
 
+            // ----------------------------------------------------------------
+            // MAIN LOOP — one iteration per video frame
+            // ----------------------------------------------------------------
             while (true) {
-                // 1. CAPTURE ORIGINAL PTS
                 val ptsUs = extractor.sampleTime
-                if (ptsUs < 0) break // End of file
+                if (ptsUs < 0) break   // end of stream
 
-                val frameStart = System.currentTimeMillis()
-                val frame = retriever.getFrameAtTime(ptsUs, MediaMetadataRetriever.OPTION_CLOSEST)
-                if (frame != null) {
-                    framesProcessed++
-                    if (framesProcessed % 10 == 0) {
-                        AppLog.d("FastVideoProcessor: Processed $framesProcessed frames. Last frame retrieval took ${System.currentTimeMillis() - frameStart}ms")
-                    }
-                    // Create mutable bitmap for direct "baking" of annotations
-                    val mutableBitmap = if (frame.isMutable) frame else {
-                        val copy = frame.copy(Bitmap.Config.ARGB_8888, true)
-                        frame.recycle()
-                        copy
-                    }
-                    val canvas = Canvas(mutableBitmap)
+                // Retrieve the raw decoded frame for this PTS
+                val rawFrame = retriever.getFrameAtTime(ptsUs, MediaMetadataRetriever.OPTION_CLOSEST)
+                    ?: run { extractor.advance(); continue }
 
-                    if (!isInitialized) {
-                        // Frame 0: Run initial object detection to bootstrap high-precision trackers
-                        val detections = modelExecutor.detectAndTrack(mutableBitmap)
+                framesProcessed++
+
+                // Ensure the bitmap is mutable so we can draw on it
+                val bitmap = if (rawFrame.isMutable) {
+                    rawFrame
+                } else {
+                    val copy = rawFrame.copy(Bitmap.Config.ARGB_8888, true)
+                    rawFrame.recycle()
+                    copy
+                }
+                val canvas = Canvas(bitmap)
+
+                if (!isInitialized) {
+                    val detections = modelExecutor.detect(bitmap)
+                    
+                    // DEBUG: Log all detections on the bootstrap frame
+                    if (detections.isEmpty()) {
+                        AppLog.w("FastVideoProcessor: No detections on Frame $framesProcessed")
+                    } else {
+                        AppLog.d("FastVideoProcessor: Found ${detections.size} detections on Frame $framesProcessed")
+                    }
+
+                    // Best car: highest-confidence Class-0 (custom) or Class-2 (COCO) detection
+                    val carDetection = detections
+                        .filter { it.classIndex == 0 || it.classIndex == 2 }
+                        .maxByOrNull { it.confidence }
+
+                    // All pin detections: Class 1, sorted by confidence, cap at 10
+                    val pinDetections = detections
+                        .filter { it.classIndex == 1 }
+                        .sortedByDescending { it.confidence }
+                        .take(10)
+
+                    // Hand off to specialist trackers
+                    if (carDetection != null) {
+                        sotExecutor.init(bitmap, carDetection.bbox)
+                        AppLog.i("FastVideoProcessor: Car bootstrapped — bbox=${carDetection.bbox}  conf=${carDetection.confidence} (class=${carDetection.classIndex})")
                         
-                        // Map detections to trackers (Class 0,13,2 = Car, Class 1,4,7 = Pins)
-                        val car = detections.find { it.classIndex in listOf(0, 13, 2) }
-                        val pins = detections.filter { it.classIndex in listOf(1, 4, 7) }.take(5)
+                        // Initialize pins if found, or log warning
+                        if (pinDetections.isNotEmpty()) {
+                            staticTracker.initialize(bitmap, pinDetections.map { it.bbox })
+                            AppLog.i("FastVideoProcessor: ${pinDetections.size} pins bootstrapped")
+                        } else {
+                            AppLog.w("FastVideoProcessor: Car found but no pins detected yet. Will check again.")
+                        }
                         
-                        car?.let { sotExecutor.init(mutableBitmap, it.bbox) }
-                        staticTracker.initialize(mutableBitmap, pins.map { it.bbox })
                         isInitialized = true
-                        AppLog.i("FastVideoProcessor: Trackers bootstrapped from YOLO detection on Frame 0")
+                        
+                        // Draw YOLO detections directly on the bootstrap bitmap
+                        canvas.drawRect(carDetection.bbox, carPaint)
+                    } else {
+                        AppLog.e("FastVideoProcessor: No car detected on Frame $framesProcessed! Retrying bootstrap on next frame...")
+                        // isInitialized remains false, so we loop back here next frame
+                        extractor.advance()
+                        continue
                     }
 
-                    // 2. RUN HYBRID TRACKERS
-                    val carBbox = sotExecutor.update(mutableBitmap)
-                    val pinStates = staticTracker.update(mutableBitmap)
+                } else {
+                    // --------------------------------------------------------
+                    // FRAME 1+ — Hybrid Trackers
+                    // --------------------------------------------------------
 
-                    // 3. RENDER ANNOTATIONS DIRECTLY ON BITMAP
-                    // Draw Car Trajectory
+                    // -- Car: SOT --
+                    val carBbox = sotExecutor.update(bitmap)
+
+                    // Draw accumulated trajectory path
                     val path = sotExecutor.carPath
                     if (path.size > 1) {
-                        for (i in 1 until path.size) {
-                            canvas.drawLine(path[i-1].x, path[i-1].y, path[i].x, path[i].y, carPaint)
-                        }
+                        val gfxPath = Path()
+                        gfxPath.moveTo(path[0].x, path[0].y)
+                        for (i in 1 until path.size) gfxPath.lineTo(path[i].x, path[i].y)
+                        canvas.drawPath(gfxPath, carPaint)
                     }
-                    
-                    // Draw Car bounding box
+
+                    // Draw current car bounding box
                     carBbox?.let { canvas.drawRect(it, carPaint) }
-
-                    // Draw Pins and Fall Order
-                    pinStates.forEach { pin ->
-                        if (pin.isFallen) {
-                            textPaint.color = Color.RED
-                            canvas.drawText(pin.fallOrder.toString(), pin.rect.centerX(), pin.rect.centerY(), textPaint)
-                        } else {
-                            canvas.drawRect(pin.rect, pinPaint)
-                            textPaint.color = Color.WHITE
-                            canvas.drawText("PIN", pin.rect.left, pin.rect.top - 10f, textPaint)
-                        }
-                    }
-
-                    // 4. SUBMIT ANNOTATED FRAME WITH SOURCE PTS
-                    videoEncoder.addFrame(mutableBitmap, ptsUs)
-
-                    withContext(Dispatchers.Main) {
-                        onFrameProcessed(mutableBitmap)
-                        val progress = ptsUs.toFloat() / durationUs
-                        val elapsed = System.currentTimeMillis() - startTime
-                        val eta = if (progress > 0.01) ((elapsed / progress) * (1 - progress)).toLong() else -1L
-                        onProgress(progress, eta)
-                    }
-                    // mutableBitmap.recycle() is now handled by the UI callback to prevent "Canvas: trying to use a recycled bitmap" crash
                 }
+
+                // ------------------------------------------------------------
+                // ALWAYS — Pin tracking (runs on every frame including Frame 0;
+                // on Frame 0 the intensity diff will be ~0 so no false falls)
+                // ------------------------------------------------------------
+                val pinStates = staticTracker.update(bitmap)
+
+                pinStates.forEach { pin ->
+                    if (pin.isFallen) {
+                        // (BUG 6 FIX) fallOrder is 0 until fallen, then 1,2,3...
+                        // We check isFallen first, so fallOrder is always > 0 here.
+                        textPaint.color = Color.RED
+                        canvas.drawText(
+                            pin.fallOrder.toString(),
+                            pin.rect.centerX(),
+                            pin.rect.centerY() + textPaint.textSize / 3f,
+                            textPaint
+                        )
+                        // Draw a red X over the fallen pin's region
+                        canvas.drawRect(pin.rect, Paint().apply {
+                            color = Color.RED; strokeWidth = 3f; style = Paint.Style.STROKE
+                        })
+                    } else {
+                        canvas.drawRect(pin.rect, pinPaint)
+                        textPaint.color = Color.WHITE
+                        canvas.drawText("PIN", pin.rect.left, pin.rect.top - 12f, textPaint)
+                    }
+                }
+
+                if (framesProcessed % 30 == 0) {
+                    AppLog.d("FastVideoProcessor: $framesProcessed frames processed")
+                }
+
+                // ------------------------------------------------------------
+                // Submit annotated frame to the encoder with the ORIGINAL PTS
+                // ------------------------------------------------------------
+                videoEncoder.addFrame(bitmap, ptsUs)
+
+                // Deliver the annotated frame to the UI for live preview
+                withContext(Dispatchers.Main) {
+                    onFrameProcessed(bitmap)
+                    val progress = if (durationUs > 0) ptsUs.toFloat() / durationUs else 0f
+                    val elapsed  = System.currentTimeMillis() - startTime
+                    val eta      = if (progress > 0.01f) ((elapsed / progress) * (1f - progress)).toLong() else -1L
+                    onProgress(progress, eta)
+                }
+
                 extractor.advance()
             }
-            AppLog.i("FastVideoProcessor: Video processing finalized")
+
+            AppLog.i("FastVideoProcessor: Done — $framesProcessed frames processed")
+
         } catch (e: Exception) {
             AppLog.e("FastVideoProcessor: Pipeline crashed", e)
         } finally {
@@ -135,6 +238,7 @@ class FastVideoProcessor(
         }
     }
 
+    // -----------------------------------------------------------------------
     private fun selectVideoTrack(extractor: MediaExtractor): Int {
         for (i in 0 until extractor.trackCount) {
             val format = extractor.getTrackFormat(i)

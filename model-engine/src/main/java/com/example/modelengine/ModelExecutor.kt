@@ -14,30 +14,39 @@ import java.io.IOException
 
 /**
  * ModelExecutor handles the loading and execution of YOLOv8 TorchScript Lite models.
+ *
+ * Two public entry-points:
+ *  • detect()         – raw YOLO output, no SORT. Use for Bootstrap (Frame 0).
+ *  • detectAndTrack() – YOLO + SORT. Use for live camera preview.
  */
 class ModelExecutor(private val context: Context) {
-    private var modelPath: String? = null
     private var module: Module? = null
     private var lastInferenceTime: Long = 0
     private val sortTracker = SortTracker()
 
-    // YOLOv8 Constants
+    // YOLOv8 input dimensions
     private val inputWidth = 640
     private val inputHeight = 640
-    private val confidenceThreshold = 0.20f // Lowered to ensure car is caught
+
+    // Confidence threshold for initial detections.
+    // Lowered to 0.15 to capture small/distant pins.
+    private val confidenceThreshold = 0.15f
     private val nmsThreshold = 0.45f
+
+    // YOLOv8-nano trained on 3 classes (Car=0, Pin=1, Fallen=2).
+    private val numClasses = 3
 
     fun loadModel(assetName: String) {
         try {
             val numThreads = Runtime.getRuntime().availableProcessors()
             PyTorchAndroid.setNumThreads(numThreads)
-            AppLog.i("Setting CPU threads to: $numThreads")
+            AppLog.i("ModelExecutor: Using $numThreads CPU threads")
 
-            modelPath = assetFilePath(context, assetName)
-            module = Module.load(modelPath)
-            AppLog.i("Model successfully loaded from: $modelPath")
+            val path = assetFilePath(context, assetName)
+            module = Module.load(path)
+            AppLog.i("ModelExecutor: Model loaded from $path")
         } catch (e: IOException) {
-            AppLog.e("Model loading failed", e)
+            AppLog.e("ModelExecutor: Model loading failed", e)
         }
     }
 
@@ -46,79 +55,105 @@ class ModelExecutor(private val context: Context) {
         lastInferenceTime = 0
     }
 
-    /**
-     * Executes YOLO inference on the full frame and updates object tracks.
-     */
-    fun detectAndTrack(bitmap: Bitmap): List<SortTracker.Track> {
-        val moduleInstance = module ?: return emptyList()
+    // -------------------------------------------------------------------------
+    // PUBLIC: Raw YOLO detection — NO SORT.  Use for Frame 0 bootstrap.
+    // Returns detections scaled to the input bitmap's pixel space.
+    // -------------------------------------------------------------------------
+    fun detect(bitmap: Bitmap): List<SortTracker.Detection> {
+        val moduleInstance = module ?: run {
+            AppLog.e("ModelExecutor.detect: model not loaded")
+            return emptyList()
+        }
+
         val startTime = SystemClock.elapsedRealtime()
 
-        // 1. Pre-processing: Resize and Normalize
+        // 1. Pre-process
         val resizedBitmap = Bitmap.createScaledBitmap(bitmap, inputWidth, inputHeight, true)
         val inputTensor = TensorImageUtils.bitmapToFloat32Tensor(
             resizedBitmap,
-            floatArrayOf(0f, 0f, 0f), // YOLO typically expects 0-1, so mean 0, std 1
-            floatArrayOf(1f, 1f, 1f)
+            floatArrayOf(0f, 0f, 0f),   // no mean subtraction (YOLO expects 0-1 range)
+            floatArrayOf(1f, 1f, 1f)    // no std division
         )
-        
-        // Recycle resized bitmap if it was a copy
-        if (resizedBitmap != bitmap) {
-            resizedBitmap.recycle()
-        }
+        if (resizedBitmap != bitmap) resizedBitmap.recycle()
 
         // 2. Inference
-        val output = moduleInstance.forward(IValue.from(inputTensor))
-        val outputTensor = output.toTensor()
+        val outputTensor = moduleInstance.forward(IValue.from(inputTensor)).toTensor()
         val data = outputTensor.dataAsFloatArray
 
-        // 3. Post-processing: Parse boxes and Apply NMS
-        val rawDetections = if (data.size == 1800) {
-            parseEndToEndOutput(data)
-        } else {
-            val raw = parseYoloOutput(data)
-            applyNMS(raw)
+        // 3. Parse + NMS
+        val rawDetections = when {
+            // End-to-end format: [1, 300, 6]  (e.g. YOLOv10)
+            data.size == 1800 -> parseEndToEndOutput(data)
+            // Standard YOLOv8 transposed format: [1, (4+numClasses), 8400]
+            else -> applyNMS(parseYoloOutput(data))
         }
 
-        // Scale detections from model space (640x640) to Bitmap space
+        lastInferenceTime = SystemClock.elapsedRealtime() - startTime
+        AppLog.d("ModelExecutor.detect: ${rawDetections.size} detections in ${lastInferenceTime}ms")
+
+        // 4. Scale from model space (640×640) back to original bitmap space
         val scaleX = bitmap.width.toFloat() / inputWidth
         val scaleY = bitmap.height.toFloat() / inputHeight
-        
-        val scaledDetections = rawDetections.map { det ->
+
+        return rawDetections.map { det ->
+            AppLog.d("  > Found [Class ${det.classIndex}] conf=${"%.3f".format(det.confidence)}")
             SortTracker.Detection(
                 RectF(
-                    det.bbox.left * scaleX,
-                    det.bbox.top * scaleY,
-                    det.bbox.right * scaleX,
+                    det.bbox.left   * scaleX,
+                    det.bbox.top    * scaleY,
+                    det.bbox.right  * scaleX,
                     det.bbox.bottom * scaleY
                 ),
                 det.classIndex,
                 det.confidence
             )
         }
-
-        // 4. Update Tracker
-        val tracks = sortTracker.update(scaledDetections)
-
-        lastInferenceTime = SystemClock.elapsedRealtime() - startTime
-        return tracks
     }
 
+    // -------------------------------------------------------------------------
+    // PUBLIC: YOLO + SORT.  Use for live camera preview only.
+    // -------------------------------------------------------------------------
+    fun detectAndTrack(bitmap: Bitmap): List<SortTracker.Track> {
+        val scaledDetections = detect(bitmap)
+        return sortTracker.update(scaledDetections)
+    }
+
+    // -------------------------------------------------------------------------
+    // PRIVATE: Parsing helpers
+    // -------------------------------------------------------------------------
+
+    /**
+     * Parses standard YOLOv8 output shape [1, (4+numClasses), 8400].
+     * The tensor is stored in row-major order: data[row * 8400 + col].
+     */
     private fun parseYoloOutput(data: FloatArray): List<SortTracker.Detection> {
-        val detections = mutableListOf<SortTracker.Detection>()
         val numPredictions = 8400
-        val numClasses = 3
-        
         val expectedSize = (4 + numClasses) * numPredictions
+
         if (data.size != expectedSize) {
-            AppLog.e("YOLO output data size mismatch: expected $expectedSize, got ${data.size}")
-            return detections
+            AppLog.e("parseYoloOutput: size mismatch — expected $expectedSize, got ${data.size}. " +
+                     "Check numClasses (currently $numClasses).")
+            // Attempt a best-effort parse by inferring numClasses from actual data size
+            val inferredClasses = (data.size / numPredictions) - 4
+            if (inferredClasses < 1 || inferredClasses > 100) return emptyList()
+            return parseYoloOutputWithClasses(data, inferredClasses, numPredictions)
         }
 
-        for (i in 0 until numPredictions) {
+        return parseYoloOutputWithClasses(data, numClasses, numPredictions)
+    }
+
+    private fun parseYoloOutputWithClasses(
+        data: FloatArray,
+        nc: Int,
+        numPred: Int
+    ): List<SortTracker.Detection> {
+        val detections = mutableListOf<SortTracker.Detection>()
+
+        for (i in 0 until numPred) {
             var maxProb = 0f
             var classIdx = -1
-            for (c in 0 until numClasses) {
-                val prob = data[ (4 + c) * numPredictions + i ]
+            for (c in 0 until nc) {
+                val prob = data[(4 + c) * numPred + i]
                 if (prob > maxProb) {
                     maxProb = prob
                     classIdx = c
@@ -126,17 +161,14 @@ class ModelExecutor(private val context: Context) {
             }
 
             if (maxProb > confidenceThreshold) {
-                val cx = data[ 0 * numPredictions + i ]
-                val cy = data[ 1 * numPredictions + i ]
-                val w = data[ 2 * numPredictions + i ]
-                val h = data[ 3 * numPredictions + i ]
+                val cx = data[0 * numPred + i]
+                val cy = data[1 * numPred + i]
+                val w  = data[2 * numPred + i]
+                val h  = data[3 * numPred + i]
 
-                val left = cx - w / 2f
-                val top = cy - h / 2f
-                
                 detections.add(
                     SortTracker.Detection(
-                        RectF(left, top, left + w, top + h),
+                        RectF(cx - w / 2f, cy - h / 2f, cx + w / 2f, cy + h / 2f),
                         classIdx,
                         maxProb
                     )
@@ -147,32 +179,22 @@ class ModelExecutor(private val context: Context) {
     }
 
     /**
-     * Parses End-to-End models (e.g. YOLOv10) which output [1, 300, 6].
-     * Data format: [x1, y1, x2, y2, score, class]
+     * Parses end-to-end model output shape [1, 300, 6].
+     * Format per detection: [x1, y1, x2, y2, score, classId].
      */
     private fun parseEndToEndOutput(data: FloatArray): List<SortTracker.Detection> {
         val detections = mutableListOf<SortTracker.Detection>()
-        val numDetections = 300
-        val elementsPerDetection = 6
+        val numDetections = data.size / 6
 
         for (i in 0 until numDetections) {
-            val offset = i * elementsPerDetection
-            val score = data[offset + 4]
+            val offset = i * 6
+            val score    = data[offset + 4]
             val classIdx = data[offset + 5].toInt()
-            
-            if (i < 5) { // Log top 5 detections for debugging
-                AppLog.d("Top Detections [$i]: Class=$classIdx, Score=$score")
-            }
 
             if (score > confidenceThreshold) {
-                val x1 = data[offset + 0]
-                val y1 = data[offset + 1]
-                val x2 = data[offset + 2]
-                val y2 = data[offset + 3]
-                
                 detections.add(
                     SortTracker.Detection(
-                        RectF(x1, y1, x2, y2),
+                        RectF(data[offset], data[offset + 1], data[offset + 2], data[offset + 3]),
                         classIdx,
                         score
                     )
@@ -183,18 +205,16 @@ class ModelExecutor(private val context: Context) {
     }
 
     private fun applyNMS(detections: List<SortTracker.Detection>): List<SortTracker.Detection> {
-        val sorted = detections.sortedByDescending { it.confidence }
-        val result = mutableListOf<SortTracker.Detection>()
+        val sorted  = detections.sortedByDescending { it.confidence }
+        val result  = mutableListOf<SortTracker.Detection>()
         val ignored = BooleanArray(sorted.size)
 
         for (i in sorted.indices) {
             if (ignored[i]) continue
-            val d1 = sorted[i]
-            result.add(d1)
+            result.add(sorted[i])
             for (j in i + 1 until sorted.size) {
                 if (ignored[j]) continue
-                val d2 = sorted[j]
-                if (calculateIoU(d1.bbox, d2.bbox) > nmsThreshold) {
+                if (calculateIoU(sorted[i].bbox, sorted[j].bbox) > nmsThreshold) {
                     ignored[j] = true
                 }
             }
@@ -202,11 +222,11 @@ class ModelExecutor(private val context: Context) {
         return result
     }
 
-    private fun calculateIoU(rect1: RectF, rect2: RectF): Float {
-        val intersection = RectF()
-        if (!intersection.setIntersect(rect1, rect2)) return 0f
-        val interArea = intersection.width() * intersection.height()
-        val unionArea = (rect1.width() * rect1.height()) + (rect2.width() * rect2.height()) - interArea
+    private fun calculateIoU(r1: RectF, r2: RectF): Float {
+        val inter = RectF()
+        if (!inter.setIntersect(r1, r2)) return 0f
+        val interArea = inter.width() * inter.height()
+        val unionArea = r1.width() * r1.height() + r2.width() * r2.height() - interArea
         return if (unionArea > 0) interArea / unionArea else 0f
     }
 
@@ -228,4 +248,3 @@ class ModelExecutor(private val context: Context) {
         }
     }
 }
-

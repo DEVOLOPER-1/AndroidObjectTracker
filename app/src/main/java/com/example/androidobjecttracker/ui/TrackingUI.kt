@@ -5,8 +5,6 @@ import android.graphics.PointF
 import android.net.Uri
 import android.widget.VideoView
 import androidx.camera.view.PreviewView
-import androidx.compose.foundation.Canvas
-import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
@@ -15,20 +13,22 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.asImageBitmap
-import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.compose.foundation.Image
 import com.example.modelengine.StaticTracker
 
 enum class AppState {
     IDLE, RECORDING, PROCESSING, RESULTS
 }
+
+// =============================================================================
+// Root screen router
+// =============================================================================
 
 @Composable
 fun TrackingScreen(
@@ -51,53 +51,39 @@ fun TrackingScreen(
     Box(modifier = Modifier.fillMaxSize()) {
         when (appState) {
             AppState.IDLE, AppState.RECORDING -> {
-                CameraCaptureView(previewView, appState == AppState.RECORDING, useSot, onRecordToggle, onPickVideo, onToggleSot)
+                CameraCaptureView(
+                    previewView    = previewView,
+                    isRecording    = appState == AppState.RECORDING,
+                    useSot         = useSot,
+                    onRecordToggle = onRecordToggle,
+                    onPickVideo    = onPickVideo,
+                    onToggleSot    = onToggleSot
+                )
             }
             AppState.PROCESSING -> {
-                Box(modifier = Modifier.fillMaxSize()) {
-                    if (currentFrame != null) {
-                        Image(
-                            bitmap = currentFrame.asImageBitmap(),
-                            contentDescription = null,
-                            modifier = Modifier.fillMaxSize(),
-                            contentScale = ContentScale.Fit
-                        )
-                        
-                        Canvas(modifier = Modifier.fillMaxSize()) {
-                            if (carPath.size > 1) {
-                                val path = Path()
-                                path.moveTo(carPath[0].x, carPath[0].y)
-                                carPath.forEach { p -> path.lineTo(p.x, p.y) }
-                                drawPath(path, Color.Yellow, style = Stroke(width = 2.dp.toPx()))
-                            }
-                            pins.forEach { pin ->
-                                val color = if (pin.isFallen) Color.Red else Color.Green
-                                drawCircle(color, radius = 10.dp.toPx(), center = Offset(pin.rect.centerX(), pin.rect.centerY()))
-                            }
-                        }
-                    }
-                    ProcessingView(processingProgress, processingEtaMs)
-                }
+                ProcessingView(
+                    currentFrame = currentFrame,
+                    progress     = processingProgress,
+                    etaMs        = processingEtaMs
+                )
             }
             AppState.RESULTS -> {
-                ResultsView(currentFrame, resultVideoUri, pins, carPath, finalStats, onSaveResult, onReset)
+                ResultsView(
+                    videoUri  = resultVideoUri,
+                    lastFrame = currentFrame,
+                    pins      = pins,
+                    stats     = finalStats,
+                    onSave    = onSaveResult,
+                    onReset   = onReset
+                )
             }
         }
     }
 }
 
-@Composable
-fun Label(text: String, x: Float, y: Float, color: Color) {
-    val density = androidx.compose.ui.platform.LocalDensity.current.density
-    Box(
-        modifier = Modifier
-            .offset(x = (x / density).dp, y = (y / density).dp)
-            .background(Color.Black.copy(alpha = 0.6f), RoundedCornerShape(4.dp))
-            .padding(horizontal = 4.dp, vertical = 2.dp)
-    ) {
-        Text(text = text, color = color, fontSize = 10.sp, fontWeight = androidx.compose.ui.text.font.FontWeight.Bold)
-    }
-}
+// =============================================================================
+// IDLE / RECORDING — Camera preview + controls
+// =============================================================================
 
 @Composable
 fun CameraCaptureView(
@@ -109,27 +95,36 @@ fun CameraCaptureView(
     onToggleSot: () -> Unit
 ) {
     Box(modifier = Modifier.fillMaxSize()) {
+
+        // Live camera feed
         if (previewView != null) {
-            AndroidView(factory = { previewView }, modifier = Modifier.fillMaxSize())
+            AndroidView(
+                factory  = { previewView },
+                modifier = Modifier.fillMaxSize()
+            )
         }
-        
-        // SOT Toggle
+
+        // ---- Advanced-tracking toggle (top-right) ----
         if (!isRecording) {
             Row(
                 modifier = Modifier
                     .align(Alignment.TopEnd)
                     .padding(16.dp)
-                    .background(Color.Black.copy(0.6f), RoundedCornerShape(8.dp))
-                    .padding(8.dp),
+                    .background(Color.Black.copy(alpha = 0.6f), RoundedCornerShape(8.dp))
+                    .padding(horizontal = 12.dp, vertical = 8.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Text("ADVANCED TRACKING", color = Color.White, style = MaterialTheme.typography.labelSmall)
+                Text(
+                    text  = "SOT TRACKING",
+                    color = Color.White,
+                    style = MaterialTheme.typography.labelSmall
+                )
                 Spacer(modifier = Modifier.width(8.dp))
                 Switch(checked = useSot, onCheckedChange = { onToggleSot() })
             }
         }
-        
-        // Recording UI
+
+        // ---- Bottom controls ----
         Column(
             modifier = Modifier
                 .align(Alignment.BottomCenter)
@@ -137,137 +132,210 @@ fun CameraCaptureView(
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
             if (!isRecording) {
-                Button(onClick = onPickVideo, colors = ButtonDefaults.buttonColors(containerColor = Color.White, contentColor = Color.Black)) {
+                Button(
+                    onClick = onPickVideo,
+                    colors  = ButtonDefaults.buttonColors(
+                        containerColor = Color.White,
+                        contentColor   = Color.Black
+                    )
+                ) {
                     Text("PICK FROM GALLERY")
                 }
                 Spacer(modifier = Modifier.height(16.dp))
             }
-            
-            IconButton(
-                onClick = onRecordToggle,
+
+            // Record button
+            Box(
                 modifier = Modifier
                     .size(80.dp)
                     .background(Color.White, CircleShape)
                     .padding(4.dp)
                     .background(Color.Black, CircleShape)
                     .padding(2.dp)
-                    .background(if (isRecording) Color.Red else Color.White, CircleShape)
-            ) {}
-            
+                    .background(if (isRecording) Color.Red else Color.White, CircleShape),
+                contentAlignment = Alignment.Center
+            ) {
+                IconButton(onClick = onRecordToggle, modifier = Modifier.fillMaxSize()) {}
+            }
+
             if (isRecording) {
-                Text("RECORDING...", color = Color.Red, modifier = Modifier.padding(top = 8.dp), style = MaterialTheme.typography.labelLarge)
+                Text(
+                    text     = "● RECORDING",
+                    color    = Color.Red,
+                    modifier = Modifier.padding(top = 8.dp),
+                    style    = MaterialTheme.typography.labelLarge
+                )
             }
         }
     }
 }
 
+// =============================================================================
+// PROCESSING — Live annotated-frame preview + progress overlay
+//
+// BUG 9 FIX: The previous version drew a second Canvas layer (carPath + pins)
+// on top of the current frame in SCREEN coordinates, while the path/pin
+// coordinates are in FRAME pixel space.  These two spaces differ whenever the
+// frame is not the same size as the screen (always true on real devices), so
+// the overlay annotations appeared at completely wrong positions AND were
+// rendered twice (once baked into the bitmap by FastVideoProcessor, once by
+// the Compose Canvas).
+//
+// Fix: display the annotated frame as-is (annotations already baked in by
+// FastVideoProcessor) and show only the non-spatial UI elements (progress
+// bar, ETA text) on top.
+// =============================================================================
+
 @Composable
-fun ProcessingView(progress: Float, etaMs: Long) {
-    Box(modifier = Modifier.fillMaxSize().background(Color.Black.copy(alpha = 0.4f)), contentAlignment = Alignment.Center) {
-        Column(horizontalAlignment = Alignment.CenterHorizontally) {
-            CircularProgressIndicator(progress = { progress }, color = Color.Cyan, strokeWidth = 6.dp, modifier = Modifier.size(100.dp))
-            Spacer(modifier = Modifier.height(24.dp))
-            Text("PROCESSING VIDEO...", color = Color.White, style = MaterialTheme.typography.headlineSmall)
-            Text("${(progress * 100).toInt()}%", color = Color.Cyan, modifier = Modifier.padding(top = 8.dp))
-            
-            if (etaMs > 0) {
-                Text(
-                    text = "Estimated time remaining: ${etaMs / 1000}s",
-                    color = Color.White.copy(alpha = 0.7f),
-                    modifier = Modifier.padding(top = 16.dp),
-                    style = MaterialTheme.typography.bodyMedium
+fun ProcessingView(
+    currentFrame: Bitmap?,
+    progress: Float,
+    etaMs: Long
+) {
+    Box(modifier = Modifier.fillMaxSize().background(Color.Black)) {
+
+        // Annotated frame (annotations already baked by FastVideoProcessor)
+        if (currentFrame != null) {
+            Image(
+                bitmap             = currentFrame.asImageBitmap(),
+                contentDescription = "Processing frame",
+                modifier           = Modifier.fillMaxSize(),
+                contentScale       = ContentScale.Fit
+            )
+        }
+
+        // Semi-transparent progress overlay — pure UI elements, no spatial drawing
+        Box(
+            modifier        = Modifier
+                .fillMaxSize()
+                .background(Color.Black.copy(alpha = 0.35f)),
+            contentAlignment = Alignment.Center
+        ) {
+            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                CircularProgressIndicator(
+                    progress  = { progress },
+                    color     = Color.Cyan,
+                    strokeWidth = 6.dp,
+                    modifier  = Modifier.size(100.dp)
                 )
-            } else {
+                Spacer(modifier = Modifier.height(24.dp))
                 Text(
-                    text = "Calculating ETA...",
-                    color = Color.White.copy(alpha = 0.5f),
-                    modifier = Modifier.padding(top = 16.dp),
-                    style = MaterialTheme.typography.bodyMedium
+                    text  = "PROCESSING VIDEO…",
+                    color = Color.White,
+                    style = MaterialTheme.typography.headlineSmall
                 )
+                Text(
+                    text     = "${(progress * 100).toInt()}%",
+                    color    = Color.Cyan,
+                    modifier = Modifier.padding(top = 8.dp),
+                    style    = MaterialTheme.typography.titleLarge
+                )
+                if (etaMs > 0) {
+                    Text(
+                        text     = "ETA: ${etaMs / 1000}s remaining",
+                        color    = Color.White.copy(alpha = 0.7f),
+                        modifier = Modifier.padding(top = 16.dp),
+                        style    = MaterialTheme.typography.bodyMedium
+                    )
+                } else {
+                    Text(
+                        text     = "Calculating ETA…",
+                        color    = Color.White.copy(alpha = 0.5f),
+                        modifier = Modifier.padding(top = 16.dp),
+                        style    = MaterialTheme.typography.bodyMedium
+                    )
+                }
             }
         }
     }
 }
+
+// =============================================================================
+// RESULTS — Annotated video playback + score summary + actions
+//
+// BUG 10 FIX: The previous version drew a second Canvas overlay on the result
+// frame/video in wrong screen coordinates (same root cause as BUG 9).
+//
+// Fix: the VideoView plays the annotated MP4 (annotations baked in by
+// FastVideoProcessor/VideoEncoder), so no Compose Canvas overlay is needed.
+// Only non-spatial elements are drawn on top: the stats card and the buttons.
+// =============================================================================
 
 @Composable
 fun ResultsView(
-    frame: Bitmap?,
-    videoUri: Uri?,
-    pins: List<StaticTracker.PinState>,
-    carPath: List<PointF>,
-    stats: Pair<Long, Int>?,
-    onSave: () -> Unit,
-    onReset: () -> Unit
+    videoUri:  Uri?,
+    lastFrame: Bitmap?,
+    pins:      List<StaticTracker.PinState>,
+    stats:     Pair<Long, Int>?,
+    onSave:    () -> Unit,
+    onReset:   () -> Unit
 ) {
-    Box(modifier = Modifier.fillMaxSize().background(Color.Black)) {
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color.Black)
+    ) {
+
+        // ---- Main content: annotated video or last annotated frame ----
         if (videoUri != null) {
+            // Play the encoded output video (annotations already baked in)
             AndroidView(
-                factory = { context ->
+                factory  = { context ->
                     VideoView(context).apply {
                         setVideoURI(videoUri)
-                        setOnPreparedListener { it.isLooping = true }
-                        start()
+                        setOnPreparedListener { mp ->
+                            mp.isLooping = true
+                            mp.start()
+                        }
                     }
                 },
                 modifier = Modifier.fillMaxSize()
             )
-        } else if (frame != null) {
+        } else if (lastFrame != null) {
+            // Fallback: show the last processed frame (annotations baked in)
             Image(
-                bitmap = frame.asImageBitmap(),
-                contentDescription = null,
-                modifier = Modifier.fillMaxSize(),
-                contentScale = ContentScale.Fit
+                bitmap             = lastFrame.asImageBitmap(),
+                contentDescription = "Last processed frame",
+                modifier           = Modifier.fillMaxSize(),
+                contentScale       = ContentScale.Fit
             )
-            
-            Canvas(modifier = Modifier.fillMaxSize()) {
-                // Draw Car trace
-                if (carPath.size > 1) {
-                    val path = Path()
-                    path.moveTo(carPath[0].x, carPath[0].y)
-                    carPath.forEach { p -> path.lineTo(p.x, p.y) }
-                    drawPath(path, Color.Yellow, style = Stroke(width = 2.dp.toPx()))
-                }
-                
-                // Draw Pins
-                pins.forEach { pin ->
-                    val color = if (pin.isFallen) Color.Red else Color.Green
-                    drawCircle(color, radius = 10.dp.toPx(), center = Offset(pin.rect.centerX(), pin.rect.centerY()))
-                }
-            }
-
-            // Labels Layer
-            Box(modifier = Modifier.fillMaxSize()) {
-                // Car Label
-                if (carPath.isNotEmpty()) {
-                    val last = carPath.last()
-                    Label(text = "RC CAR", x = last.x, y = last.y - 40, color = Color.Cyan)
-                }
-
-                // Pin Labels
-                pins.forEach { pin ->
-                    if (pin.isFallen) {
-                        Label(text = "#${pin.fallOrder}", x = pin.rect.centerX(), y = pin.rect.centerY(), color = Color.Red)
-                    } else {
-                        Label(text = "PIN", x = pin.rect.centerX(), y = pin.rect.centerY() - 40, color = Color.White)
-                    }
-                }
-            }
         }
 
-        // Top Stats Overlay
-        stats?.let { (time, count) ->
+        // ---- Score summary overlay (top-left) ----
+        stats?.let { (elapsedMs, pinsHit) ->
             Column(
                 modifier = Modifier
+                    .align(Alignment.TopStart)
                     .padding(16.dp)
-                    .background(Color.Black.copy(0.7f), RoundedCornerShape(8.dp))
-                    .padding(12.dp)
+                    .background(Color.Black.copy(alpha = 0.72f), RoundedCornerShape(10.dp))
+                    .padding(14.dp)
             ) {
-                Text("Run Time: ${time / 1000}s", color = Color.White)
-                Text("Pins Hit: $count", color = Color.Yellow, style = MaterialTheme.typography.titleLarge)
+                Text(
+                    text  = "⏱  ${elapsedMs / 1000}s",
+                    color = Color.White,
+                    style = MaterialTheme.typography.titleMedium
+                )
+                Spacer(modifier = Modifier.height(4.dp))
+                Text(
+                    text  = "🎳  $pinsHit pin${if (pinsHit != 1) "s" else ""} knocked down",
+                    color = Color.Yellow,
+                    style = MaterialTheme.typography.titleLarge
+                )
+
+                // Per-pin fall order summary
+                val fallenPins = pins.filter { it.isFallen }.sortedBy { it.fallOrder }
+                if (fallenPins.isNotEmpty()) {
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Text(
+                        text     = "Fall order: " + fallenPins.joinToString(" → ") { "#${it.fallOrder}" },
+                        color    = Color.White.copy(alpha = 0.85f),
+                        fontSize = 13.sp
+                    )
+                }
             }
         }
 
-        // Bottom Actions
+        // ---- Action buttons (bottom-center) ----
         Row(
             modifier = Modifier
                 .align(Alignment.BottomCenter)
@@ -277,15 +345,18 @@ fun ResultsView(
         ) {
             Button(
                 onClick = onReset,
-                colors = ButtonDefaults.buttonColors(containerColor = Color.Gray)
+                colors  = ButtonDefaults.buttonColors(containerColor = Color.DarkGray)
             ) {
                 Text("RESTART")
             }
             Button(
                 onClick = onSave,
-                colors = ButtonDefaults.buttonColors(containerColor = Color.Cyan, contentColor = Color.Black)
+                colors  = ButtonDefaults.buttonColors(
+                    containerColor = Color.Cyan,
+                    contentColor   = Color.Black
+                )
             ) {
-                Text("SAVE VIDEO")
+                Text("SAVE TO GALLERY")
             }
         }
     }
