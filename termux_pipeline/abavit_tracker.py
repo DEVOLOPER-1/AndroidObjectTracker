@@ -28,6 +28,21 @@ except Exception:
     ort = None  # ONNX not available; fallback to CV template-matching
 
 
+# -------------------------
+# Tweakable hyperparameters
+# -------------------------
+# Template / search sizes expected by the ONNX model (width, height)
+TEMPLATE_SIZE: tuple[int, int] = (128, 128)
+SEARCH_SIZE: tuple[int, int] = (256, 256)
+# Default scale for the template-match search window (fraction of bbox)
+TEMPLATE_SEARCH_SCALE: float = 2.0
+# Alpha blending used when adaptively updating the template (0..1)
+TEMPLATE_UPDATE_ALPHA: float = 0.1
+# Default padding fraction applied by _extract_patch when used without an explicit pad
+TEMPLATE_PAD_DEFAULT: float = 0.0
+
+
+
 class _ONNXWrapper:
     def __init__(self, model_path: Path):
         self.model_path = model_path
@@ -60,8 +75,8 @@ class _ONNXWrapper:
         return np.expand_dims(arr, axis=0).astype(np.float32)
 
     def predict(self, template_rgb: np.ndarray, search_rgb: np.ndarray) -> np.ndarray:
-        template = self._prepare_tensor(template_rgb, (128, 128))
-        search = self._prepare_tensor(search_rgb, (256, 256))
+        template = self._prepare_tensor(template_rgb, TEMPLATE_SIZE)
+        search = self._prepare_tensor(search_rgb, SEARCH_SIZE)
         out = self.session.run(
             [self.pred_boxes_output_name],
             {self.template_input_name: template, self.search_input_name: search},
@@ -125,11 +140,11 @@ class AbaViTracker:
             return np.zeros((1, 3, 128, 128), dtype=np.float32)
         if template_patch.dtype != np.uint8:
             template_patch = np.clip(template_patch, 0, 255).astype(np.uint8)
-        resized = cv.resize(template_patch, (128, 128), interpolation=cv.INTER_LINEAR)
+        resized = cv.resize(template_patch, TEMPLATE_SIZE, interpolation=cv.INTER_LINEAR)
         arr = resized.astype(np.float32) / 255.0
         return np.expand_dims(np.transpose(arr, (2, 0, 1)), axis=0).astype(np.float32)
 
-    def _extract_patch(self, frame: np.ndarray, bbox: tuple[int, int, int, int], pad: float = 0.0) -> np.ndarray:
+    def _extract_patch(self, frame: np.ndarray, bbox: tuple[int, int, int, int], pad: float = TEMPLATE_PAD_DEFAULT) -> np.ndarray:
         x, y, w, h = bbox
         if pad > 0:
             xp = max(0, int(x - w * pad))
@@ -147,7 +162,7 @@ class AbaViTracker:
         patch = frame[y1:y2, x1:x2].copy()
         return patch
 
-    def _template_track(self, frame: np.ndarray, search_scale: float = 2.0) -> tuple[int, int, int, int]:
+    def _template_track(self, frame: np.ndarray, search_scale: float = TEMPLATE_SEARCH_SCALE) -> tuple[int, int, int, int]:
         """
         Template-match in a search window around previous bbox.
         Returns new bbox (x,y,w,h)
@@ -255,7 +270,7 @@ class AbaViTracker:
 
         if new_bbox is None:
             # fallback to template matching
-            new_bbox = self._template_track(frame, search_scale=2.0)
+            new_bbox = self._template_track(frame)
 
         # update internal state
         self.prev_bbox = new_bbox
@@ -264,7 +279,7 @@ class AbaViTracker:
             # refresh template slowly (simple linear update)
             new_template = self._extract_patch(frame, new_bbox)
             if new_template.size > 0 and self.template is not None and self.template.size > 0:
-                alpha = 0.1
+                alpha = TEMPLATE_UPDATE_ALPHA
                 # resize new_template to template size if different
                 if new_template.shape != self.template.shape:
                     new_template = cv.resize(new_template, (self.template.shape[1], self.template.shape[0]), interpolation=cv.INTER_LINEAR)

@@ -9,6 +9,16 @@ import numpy as np
 import onnxruntime as ort
 
 
+# -------------------------
+# Tweakable defaults for YOLO
+# -------------------------
+MODEL_FILENAME: str = "yolo26n.onnx"
+EXTERNAL_DATA_SUFFIX: str = ".data"
+INPUT_SIZE_DEFAULT: int = 640
+CONFIDENCE_THRESHOLD_DEFAULT: float = 0.1
+PROVIDERS_DEFAULT: list[str] = ["CPUExecutionProvider"]
+
+
 @dataclass(slots=True)
 class Detection:
 	box: tuple[float, float, float, float]
@@ -22,17 +32,17 @@ class YOLOTracker:
 		self,
 		model_path: str | Path | None = None,
 		*,
-		input_size: int = 640,
-		confidence_threshold: float = 0.4,
+		input_size: int = INPUT_SIZE_DEFAULT,
+		confidence_threshold: float = CONFIDENCE_THRESHOLD_DEFAULT,
 		providers: list[str] | None = None,
 		save_annotated_image: bool = False,
 		annotated_output_dir: str | Path | None = None,
 	) -> None:
-		self.model_path = Path(model_path) if model_path is not None else Path(__file__).resolve().with_name("yolo26n.onnx")
-		self.external_data_path = self.model_path.with_suffix(self.model_path.suffix + ".data")
+		self.model_path = Path(model_path) if model_path is not None else Path(__file__).resolve().with_name(MODEL_FILENAME)
+		self.external_data_path = self.model_path.with_suffix(self.model_path.suffix + EXTERNAL_DATA_SUFFIX)
 		self.input_size = input_size
 		self.confidence_threshold = confidence_threshold
-		self.providers = providers or ["CPUExecutionProvider"]
+		self.providers = providers or PROVIDERS_DEFAULT
 		self.save_annotated_image = save_annotated_image
 		self.annotated_output_dir = Path(annotated_output_dir) if annotated_output_dir is not None else Path(__file__).resolve().parent
 
