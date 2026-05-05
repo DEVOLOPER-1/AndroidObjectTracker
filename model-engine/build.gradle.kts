@@ -29,8 +29,7 @@ android {
 
 dependencies {
     implementation(libs.androidx.core.ktx)
-    api(libs.pytorch.runtime)
-    api(libs.pytorch.vision)
+    api(libs.onnxruntime.android)
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.junit)
     androidTestImplementation(libs.androidx.espresso.core)

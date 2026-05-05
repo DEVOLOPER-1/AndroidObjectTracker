@@ -38,8 +38,6 @@ android {
 
 dependencies {
     implementation(project(":model-engine"))
-    implementation(libs.pytorch.runtime)
-    implementation(libs.pytorch.vision)
 
     implementation(platform(libs.androidx.compose.bom))
     implementation(libs.androidx.ui)

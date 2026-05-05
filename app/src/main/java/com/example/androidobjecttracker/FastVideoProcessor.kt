@@ -2,82 +2,76 @@ package com.example.androidobjecttracker
 
 import android.content.Context
 import android.graphics.Bitmap
-import android.graphics.PixelFormat
 import android.media.*
 import android.net.Uri
-import android.os.Handler
-import android.os.HandlerThread
-import android.util.Log
-import android.view.Surface
 import com.example.modelengine.AppLog
 import com.example.modelengine.ModelExecutor
 import com.example.modelengine.SortTracker
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
-import java.nio.ByteBuffer
 
 class FastVideoProcessor(
     private val context: Context,
-    private val modelExecutor: ModelExecutor
+    private val modelExecutor: ModelExecutor,
+    private val videoEncoder: VideoEncoder
 ) {
-    private val TAG = "FastVideoProcessor"
-
     suspend fun processVideo(
         uri: Uri,
-        undersamplingFactor: Int = 3,
-        onProgress: (Float, Long) -> Unit,
-        onFrameProcessed: (Bitmap, List<SortTracker.Track>) -> Unit
+        onProgress: (Float, Long) -> Unit
     ) {
         val retriever = MediaMetadataRetriever()
         try {
             retriever.setDataSource(context, uri)
-            AppLog.i("Starting video processing (Undersampling: $undersamplingFactor) for URI: $uri")
             
-            val durationStr = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
-            val durationMs = durationStr?.toLong() ?: 0L
+            val durationMs = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLong() ?: 0L
             val frameCountStr = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_FRAME_COUNT)
             val totalFrames = frameCountStr?.toInt() ?: 0
             
-            AppLog.d("Video Info: $totalFrames frames, $durationMs ms")
+            val width = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toInt() ?: 1280
+            val height = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toInt() ?: 720
 
-            if (totalFrames <= 0) {
-                AppLog.e("Invalid frame count")
-                return
-            }
+            AppLog.i("Processing video: $totalFrames frames, $durationMs ms, ${width}x${height}")
+
+            videoEncoder.start(width, height)
+            modelExecutor.reset()
 
             val startTime = System.currentTimeMillis()
             
-            for (i in 0 until totalFrames step undersamplingFactor) {
-                try {
-                    // Use getFrameAtTime with OPTION_CLOSEST for better stability than getFrameAtIndex
-                    val timeUs = (i.toLong() * durationMs * 1000L) / totalFrames
-                    val bitmap = retriever.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST)
+            // Process at 30 FPS if possible, or step through total frames
+            val step = 1 
+            for (i in 0 until totalFrames step step) {
+                val timeUs = (i.toLong() * durationMs * 1000L) / totalFrames
+                val bitmap = retriever.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+                
+                if (bitmap != null) {
+                    // 1. Run inference and tracking
+                    val tracks = modelExecutor.detectAndTrack(bitmap)
                     
-                    if (bitmap != null) {
-                        val tracks = modelExecutor.detectAndTrack(bitmap)
-                        
-                        val progress = i.toFloat() / totalFrames
-                        val elapsed = System.currentTimeMillis() - startTime
-                        val etaMs = if (progress > 0.05) (elapsed / progress * (1 - progress)).toLong() else -1L
+                    // 2. Encode frame with annotations
+                    // Use a more memory-efficient way to get a mutable bitmap if needed
+                    val mutableBitmap = if (bitmap.isMutable) bitmap else bitmap.copy(Bitmap.Config.ARGB_8888, true)
+                    if (mutableBitmap != bitmap) bitmap.recycle()
+                    
+                    videoEncoder.encodeFrame(mutableBitmap, tracks)
+                    mutableBitmap.recycle()
+                    
+                    val progress = i.toFloat() / totalFrames
+                    val elapsed = System.currentTimeMillis() - startTime
+                    val etaMs = if (progress > 0.05) (elapsed / progress * (1 - progress)).toLong() else -1L
 
-                        withContext(Dispatchers.Main) {
-                            onFrameProcessed(bitmap, tracks)
-                            onProgress(progress, etaMs)
-                        }
-                        
-                        if ((i / undersamplingFactor) % 20 == 0) {
-                            val etaStr = if (etaMs > 0) "${etaMs/1000}s" else "calculating..."
-                            val detectionSummary = tracks.groupBy { it.classIndex }
-                                .map { "ID ${it.key}: ${it.value.size}" }.joinToString()
-                            AppLog.d("Frame $i/$totalFrames | Progress: ${(progress * 100).toInt()}% | ETA: $etaStr | Detections: [$detectionSummary]")
-                        }
-                    } else {
-                        AppLog.e("Frame at $i is null, skipping...")
+                    withContext(Dispatchers.Main) {
+                        onProgress(progress, etaMs)
                     }
-                } catch (e: Exception) {
-                    AppLog.e("Failed to extract frame at $i", e)
-                    // Continue to next frame instead of crashing
+                    
+                    if (i % 30 == 0) {
+                        AppLog.d("Progress: ${(progress * 100).toInt()}% | Frame: $i")
+                    }
                 }
+            }
+
+            val resultFile = videoEncoder.finish()
+            if (resultFile != null) {
+                videoEncoder.saveToGallery(resultFile)
             }
 
             withContext(Dispatchers.Main) {
@@ -87,10 +81,7 @@ class FastVideoProcessor(
         } catch (e: Exception) {
             AppLog.e("Video processing failed", e)
         } finally {
-            try {
-                retriever.release()
-            } catch (ignored: Exception) {
-            }
+            retriever.release()
         }
     }
 }

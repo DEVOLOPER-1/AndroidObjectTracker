@@ -8,14 +8,12 @@ import android.net.Uri
 import android.provider.MediaStore
 import android.view.Surface
 import com.example.modelengine.AppLog
-import com.example.modelengine.StaticTracker
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
+import com.example.modelengine.SortTracker
 import java.io.File
 
 /**
  * Utility to encode annotated frames into a final MP4 video incrementally.
- * Fixes the presentationTimeUs bug to ensure video duration matches source.
+ * Fixes the presentationTimeUs bug by enforcing strict monotonic PTS.
  */
 class VideoEncoder(private val context: Context) {
     private var codec: MediaCodec? = null
@@ -26,41 +24,41 @@ class VideoEncoder(private val context: Context) {
     private var trackIndex = -1
     private var outFile: File? = null
     
-    private var frameIntervalUs: Long = 0
-    private var currentPtsUs: Long = 0
+    private var frameCount = 0L
+    private val frameIntervalUs = 1_000_000L / 30L // Enforce strict 30 FPS
 
-    private val paint = Paint().apply {
+    private val pinPaint = Paint().apply {
         style = Paint.Style.STROKE
         strokeWidth = 6f
         isAntiAlias = true
     }
     
-    private val linePaint = Paint().apply {
-        color = Color.YELLOW
-        strokeWidth = 4f
+    private val carPathPaint = Paint().apply {
+        color = Color.CYAN // Persistent colored line for trajectory
+        strokeWidth = 5f
         style = Paint.Style.STROKE
         strokeCap = Paint.Cap.ROUND
+        isAntiAlias = true
     }
 
     private val textPaint = Paint().apply {
         color = Color.WHITE
-        textSize = 45f
+        textSize = 40f
         typeface = Typeface.DEFAULT_BOLD
         setShadowLayer(5f, 0f, 0f, Color.BLACK)
     }
 
-    fun start(width: Int, height: Int, fps: Int, undersamplingFactor: Int = 1) {
-        val fileName = "Annotated_Result_${System.currentTimeMillis()}.mp4"
+    fun start(width: Int, height: Int) {
+        val fileName = "Processed_Result_${System.currentTimeMillis()}.mp4"
         outFile = File(context.cacheDir, fileName)
         
-        frameIntervalUs = (1_000_000L / fps) * undersamplingFactor
-        currentPtsUs = 0
+        frameCount = 0
 
         val mime = MediaFormat.MIMETYPE_VIDEO_AVC
         val format = MediaFormat.createVideoFormat(mime, width, height)
         format.setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
-        format.setInteger(MediaFormat.KEY_BIT_RATE, 8_000_000)
-        format.setInteger(MediaFormat.KEY_FRAME_RATE, fps)
+        format.setInteger(MediaFormat.KEY_BIT_RATE, 10_000_000)
+        format.setInteger(MediaFormat.KEY_FRAME_RATE, 30)
         format.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
 
         codec = MediaCodec.createEncoderByType(mime).apply {
@@ -72,55 +70,62 @@ class VideoEncoder(private val context: Context) {
         muxer = MediaMuxer(outFile!!.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
         muxerStarted = false
         trackIndex = -1
-        AppLog.i("Encoder started: $width x $height @ $fps fps (Interval: $frameIntervalUs us)")
+        AppLog.i("VideoEncoder started: $width x $height @ 30 FPS")
     }
 
-    fun addFrame(bitmap: Bitmap, pins: List<StaticTracker.PinState>, carPath: List<PointF>) {
+    /**
+     * Bakes annotations into the bitmap and sends it to the encoder.
+     */
+    fun encodeFrame(bitmap: Bitmap, tracks: List<SortTracker.TrackedObject>) {
         val codec = this.codec ?: return
         val surface = this.inputSurface ?: return
 
-        // 1. Draw Annotations onto the Bitmap
         val canvas = Canvas(bitmap)
         
-        // Draw Car Trace (Persistent line)
-        if (carPath.size > 1) {
-            val path = Path()
-            path.moveTo(carPath[0].x, carPath[0].y)
-            for (i in 1 until carPath.size) {
-                path.lineTo(carPath[i].x, carPath[i].y)
+        tracks.forEach { track ->
+            when (track.classIndex) {
+                3 -> { // Car
+                    // 1. Draw trajectory path
+                    if (track.trajectory.size > 1) {
+                        val path = Path()
+                        path.moveTo(track.trajectory[0].x, track.trajectory[0].y)
+                        for (i in 1 until track.trajectory.size) {
+                            path.lineTo(track.trajectory[i].x, track.trajectory[i].y)
+                        }
+                        canvas.drawPath(path, carPathPaint)
+                    }
+                    // 2. Label car
+                    canvas.drawText("CAR ID:${track.id}", track.lastCx, track.lastCy - 20f, textPaint)
+                }
+                1 -> { // Pins
+                    if (track.state == SortTracker.State.FALLEN) {
+                        // Fallen Pin: Red box + Fall Order
+                        pinPaint.color = Color.RED
+                        canvas.drawRect(track.bbox, pinPaint)
+                        track.fallOrder?.let { order ->
+                            canvas.drawText("#$order", track.bbox.centerX(), track.bbox.centerY(), textPaint)
+                        }
+                    } else {
+                        // Standing Pin: Green box
+                        pinPaint.color = Color.GREEN
+                        canvas.drawRect(track.bbox, pinPaint)
+                        canvas.drawText("PIN", track.bbox.left, track.bbox.top - 10f, textPaint)
+                    }
+                }
             }
-            canvas.drawPath(path, linePaint)
-            
-            // Draw Car Label at current position
-            val last = carPath.last()
-            canvas.drawText("RC CAR", last.x, last.y - 20f, textPaint)
         }
 
-        // Draw Pins
-        pins.forEach { pin ->
-            if (pin.isFallen) {
-                textPaint.color = Color.RED
-                canvas.drawText("#${pin.fallOrder}", pin.currentCentroid.x, pin.currentCentroid.y, textPaint)
-            } else {
-                paint.color = Color.GREEN
-                canvas.drawCircle(pin.currentCentroid.x, pin.currentCentroid.y, 30f, paint)
-                textPaint.color = Color.WHITE
-                canvas.drawText("PIN", pin.currentCentroid.x - 20f, pin.currentCentroid.y - 40f, textPaint)
-            }
-        }
-
-        // 2. Feed annotated Bitmap to Surface with Correct Timestamp
+        // Send to Surface
         val displayCanvas = surface.lockHardwareCanvas()
         displayCanvas.drawBitmap(bitmap, 0f, 0f, null)
         surface.unlockCanvasAndPost(displayCanvas)
 
-        // 3. Drain and increment PTS
         drainEncoder(false)
-        currentPtsUs += frameIntervalUs
+        frameCount++
     }
 
     fun finish(): File? {
-        AppLog.i("Finishing video encoding...")
+        AppLog.i("Finishing video encoding. Total frames: $frameCount")
         codec?.signalEndOfInputStream()
         drainEncoder(true)
         
@@ -152,7 +157,7 @@ class VideoEncoder(private val context: Context) {
                 muxer.start()
                 muxerStarted = true
             } else if (encoderStatus >= 0) {
-                val encodedData = codec.getOutputBuffer(encoderStatus) ?: throw RuntimeException("Buffer was null")
+                val encodedData = codec.getOutputBuffer(encoderStatus) ?: throw RuntimeException("Buffer null")
                 if (bufferInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0) {
                     bufferInfo.size = 0
                 }
@@ -161,8 +166,8 @@ class VideoEncoder(private val context: Context) {
                     encodedData.position(bufferInfo.offset)
                     encodedData.limit(bufferInfo.offset + bufferInfo.size)
                     
-                    // Inject fixed timestamp to maintain correct video duration
-                    bufferInfo.presentationTimeUs = currentPtsUs
+                    // Force strict monotonic PTS
+                    bufferInfo.presentationTimeUs = frameCount * frameIntervalUs
 
                     muxer.writeSampleData(trackIndex, encodedData, bufferInfo)
                 }
@@ -174,9 +179,9 @@ class VideoEncoder(private val context: Context) {
 
     fun saveToGallery(file: File): Uri? {
         val values = ContentValues().apply {
-            put(MediaStore.Video.Media.DISPLAY_NAME, "Annotated_${file.name}")
+            put(MediaStore.Video.Media.DISPLAY_NAME, file.name)
             put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
-            put(MediaStore.Video.Media.RELATIVE_PATH, "Movies/TrackerResults")
+            put(MediaStore.Video.Media.RELATIVE_PATH, "Movies/ObjectTracker")
         }
         val uri = context.contentResolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values)
         uri?.let {
@@ -186,7 +191,7 @@ class VideoEncoder(private val context: Context) {
                 }
             }
         }
-        AppLog.i("Video saved to gallery: $uri")
+        AppLog.i("Video saved: $uri")
         return uri
     }
 }

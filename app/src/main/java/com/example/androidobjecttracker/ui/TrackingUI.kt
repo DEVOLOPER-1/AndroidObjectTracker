@@ -15,7 +15,6 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.asImageBitmap
@@ -24,7 +23,7 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
-import com.example.modelengine.StaticTracker
+import com.example.modelengine.SortTracker
 
 enum class AppState {
     IDLE, RECORDING, PROCESSING, RESULTS
@@ -38,7 +37,7 @@ fun TrackingScreen(
     resultVideoUri: Uri?,
     processingProgress: Float,
     processingEtaMs: Long,
-    pins: List<StaticTracker.PinState>,
+    pins: List<SortTracker.TrackedObject>,
     carPath: List<PointF>,
     finalStats: Pair<Long, Int>?,
     onRecordToggle: () -> Unit,
@@ -86,7 +85,6 @@ fun CameraCaptureView(
             AndroidView(factory = { previewView }, modifier = Modifier.fillMaxSize())
         }
         
-        // Recording UI
         Column(
             modifier = Modifier
                 .align(Alignment.BottomCenter)
@@ -134,13 +132,6 @@ fun ProcessingView(progress: Float, etaMs: Long) {
                     modifier = Modifier.padding(top = 16.dp),
                     style = MaterialTheme.typography.bodyMedium
                 )
-            } else {
-                Text(
-                    text = "Calculating ETA...",
-                    color = Color.White.copy(alpha = 0.5f),
-                    modifier = Modifier.padding(top = 16.dp),
-                    style = MaterialTheme.typography.bodyMedium
-                )
             }
         }
     }
@@ -150,7 +141,7 @@ fun ProcessingView(progress: Float, etaMs: Long) {
 fun ResultsView(
     frame: Bitmap?,
     videoUri: Uri?,
-    pins: List<StaticTracker.PinState>,
+    pins: List<SortTracker.TrackedObject>,
     carPath: List<PointF>,
     stats: Pair<Long, Int>?,
     onSave: () -> Unit,
@@ -175,40 +166,6 @@ fun ResultsView(
                 modifier = Modifier.fillMaxSize(),
                 contentScale = ContentScale.Fit
             )
-            
-            Canvas(modifier = Modifier.fillMaxSize()) {
-                // Draw Car trace
-                if (carPath.size > 1) {
-                    val path = Path()
-                    path.moveTo(carPath[0].x, carPath[0].y)
-                    carPath.forEach { p -> path.lineTo(p.x, p.y) }
-                    drawPath(path, Color.Yellow, style = Stroke(width = 2.dp.toPx()))
-                }
-                
-                // Draw Pins
-                pins.forEach { pin ->
-                    val color = if (pin.isFallen) Color.Red else Color.Green
-                    drawCircle(color, radius = 10.dp.toPx(), center = Offset(pin.currentCentroid.x, pin.currentCentroid.y))
-                }
-            }
-
-            // Labels Layer
-            Box(modifier = Modifier.fillMaxSize()) {
-                // Car Label
-                if (carPath.isNotEmpty()) {
-                    val last = carPath.last()
-                    Label(text = "RC CAR", x = last.x, y = last.y - 40, color = Color.Cyan)
-                }
-
-                // Pin Labels
-                pins.forEach { pin ->
-                    if (pin.isFallen) {
-                        Label(text = "#${pin.fallOrder}", x = pin.currentCentroid.x, y = pin.currentCentroid.y, color = Color.Red)
-                    } else {
-                        Label(text = "PIN", x = pin.currentCentroid.x, y = pin.currentCentroid.y - 40, color = Color.White)
-                    }
-                }
-            }
         }
 
         // Top Stats Overlay
