@@ -25,8 +25,9 @@ class VideoEncoder(private val context: Context) {
     private var outFile: File? = null
     
     private var frameCount = 0L
-    private val frameIntervalUs = 1_000_000L / 30L // Enforce strict 30 FPS
+    private val frameIntervalUs = 1_000_000L / 15L  // 15 FPS to match step=2
 
+    private var drawBuffer: Bitmap? = null
     private val pinPaint = Paint().apply {
         style = Paint.Style.STROKE
         strokeWidth = 6f
@@ -51,15 +52,17 @@ class VideoEncoder(private val context: Context) {
     fun start(width: Int, height: Int) {
         val fileName = "Processed_Result_${System.currentTimeMillis()}.mp4"
         outFile = File(context.cacheDir, fileName)
-        
         frameCount = 0
+
+        drawBuffer?.recycle()
+        drawBuffer = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
 
         val mime = MediaFormat.MIMETYPE_VIDEO_AVC
         val format = MediaFormat.createVideoFormat(mime, width, height)
         format.setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
-        format.setInteger(MediaFormat.KEY_BIT_RATE, 10_000_000)
-        format.setInteger(MediaFormat.KEY_FRAME_RATE, 30)
-        format.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
+        format.setInteger(MediaFormat.KEY_BIT_RATE, 6_000_000)   // 6 Mbps is plenty for 720p/15fps
+        format.setInteger(MediaFormat.KEY_FRAME_RATE, 15)         // matches step=2 on 30fps source
+        format.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 2)
 
         codec = MediaCodec.createEncoderByType(mime).apply {
             configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
@@ -70,7 +73,7 @@ class VideoEncoder(private val context: Context) {
         muxer = MediaMuxer(outFile!!.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
         muxerStarted = false
         trackIndex = -1
-        AppLog.i("VideoEncoder started: $width x $height @ 30 FPS")
+        AppLog.i("VideoEncoder started: ${width}x${height} @ 15 FPS, 6 Mbps")
     }
 
     /**
@@ -78,10 +81,13 @@ class VideoEncoder(private val context: Context) {
      */
     fun encodeFrame(bitmap: Bitmap, tracks: List<SortTracker.TrackedObject>) {
         val surface = this.inputSurface ?: return
+        val buffer  = this.drawBuffer  ?: return
 
-        // Draw annotations directly onto the bitmap first
-        val canvas = Canvas(bitmap)
+        // Copy source frame into reusable buffer — no allocation
+        val copyCanvas = Canvas(buffer)
+        copyCanvas.drawBitmap(bitmap, 0f, 0f, null)
 
+        // Draw annotations on top of the buffer
         tracks.forEach { track ->
             when (track.classIndex) {
                 3 -> {
@@ -91,51 +97,43 @@ class VideoEncoder(private val context: Context) {
                         for (i in 1 until track.trajectory.size) {
                             path.lineTo(track.trajectory[i].x, track.trajectory[i].y)
                         }
-                        canvas.drawPath(path, carPathPaint)
+                        copyCanvas.drawPath(path, carPathPaint)
                     }
-                    canvas.drawText(
+                    copyCanvas.drawText(
                         "CAR ID:${track.id}",
-                        track.lastCx, track.lastCy - 20f,
-                        textPaint
+                        track.lastCx, track.lastCy - 20f, textPaint
                     )
                 }
                 1 -> {
                     if (track.state == SortTracker.State.FALLEN) {
                         pinPaint.color = Color.RED
-                        canvas.drawRect(track.bbox, pinPaint)
+                        copyCanvas.drawRect(track.bbox, pinPaint)
                         track.fallOrder?.let { order ->
-                            canvas.drawText(
+                            copyCanvas.drawText(
                                 "#$order",
-                                track.bbox.centerX(), track.bbox.centerY(),
-                                textPaint
+                                track.bbox.centerX(), track.bbox.centerY(), textPaint
                             )
                         }
                     } else {
                         pinPaint.color = Color.GREEN
-                        canvas.drawRect(track.bbox, pinPaint)
-                        canvas.drawText(
-                            "PIN",
-                            track.bbox.left, track.bbox.top - 10f,
-                            textPaint
+                        copyCanvas.drawRect(track.bbox, pinPaint)
+                        copyCanvas.drawText(
+                            "PIN", track.bbox.left, track.bbox.top - 10f, textPaint
                         )
                     }
                 }
             }
         }
 
-        // Send annotated bitmap to encoder surface.
-        // lockCanvas(null) is used instead of lockHardwareCanvas() because
-        // lockHardwareCanvas() throws a native EGL crash on Exynos/Samsung
-        // devices when the encoder surface is not hardware-canvas compatible.
+        // Send to encoder surface
         val surfaceCanvas = try {
             surface.lockCanvas(null)
         } catch (e: Exception) {
             AppLog.e("VideoEncoder: lockCanvas failed, skipping frame $frameCount", e)
             return
         }
-
         try {
-            surfaceCanvas.drawBitmap(bitmap, 0f, 0f, null)
+            surfaceCanvas.drawBitmap(buffer, 0f, 0f, null)
         } finally {
             surface.unlockCanvasAndPost(surfaceCanvas)
         }
@@ -144,22 +142,21 @@ class VideoEncoder(private val context: Context) {
         frameCount++
     }
 
+
     fun finish(): File? {
         AppLog.i("Finishing video encoding. Total frames: $frameCount")
         codec?.signalEndOfInputStream()
         drainEncoder(true)
-        
         codec?.stop()
         codec?.release()
         codec = null
-        
-        if (muxerStarted) {
-            muxer?.stop()
-        }
+        if (muxerStarted) muxer?.stop()
         muxer?.release()
         muxer = null
-        
         inputSurface = null
+        // Release draw buffer
+        drawBuffer?.recycle()
+        drawBuffer = null
         return outFile
     }
 
