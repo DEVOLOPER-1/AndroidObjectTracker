@@ -6,18 +6,30 @@ import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.sqrt
 
 /**
- * Centroid-based tracker for maintaining object identities across frames.
- * Implements specific logic for Pin Fall detection and Car Trajectory tracking.
+ * Centroid-based identity tracker.
+ *
+ * After the bootstrap migration, this class is responsible ONLY for the car
+ * (classIndex 3). Pins are tracked by StaticTracker.
+ *
+ * On each frame it:
+ *   1. Ages every existing track by +1.
+ *   2. Greedily matches new detections to existing tracks by minimum
+ *      Euclidean centroid distance.
+ *   3. Updates matched tracks (resets age, appends trajectory point).
+ *   4. Creates new tracks for unmatched detections.
+ *   5. Purges tracks that have not been matched for > maxAge frames.
  */
 class SortTracker {
+
+    // --- Configuration ---
+    private val maxAge             = 10
+    private val distanceThreshold  = 150f  // px — max centroid distance for a valid match
+
+    // --- State ---
     private val nextId = AtomicInteger(1)
-    private var currentFallCount = 0
     private val tracks = mutableListOf<TrackedObject>()
-    
-    // Configuration
-    private val maxAge = 10
-    private val distanceThreshold = 150f // Max pixels for centroid matching
-    private val fallMovementThreshold = 50f // Pixels moved to confirm fall
+
+    // --- Data model (shared with StaticTracker output) ---
 
     data class TrackedObject(
         val id: Int,
@@ -31,35 +43,36 @@ class SortTracker {
         val trajectory: MutableList<PointF> = mutableListOf()
     )
 
-    enum class State {
-        STANDING,
-        FALLEN
-    }
+    enum class State { STANDING, FALLEN }
+
+    // --- Public API ---
 
     /**
-     * Updates tracks with new detections from YOLO.
+     * Feed new detections from YoloExecutor. Returns the current live track list.
+     * Should be called with CAR detections only after bootstrap.
      */
     fun update(detections: List<YoloExecutor.Detection>): List<TrackedObject> {
-        // 1. Predict/Age existing tracks
+
+        // 1. Age all tracks
         tracks.forEach { it.age++ }
 
         val matchedDetections = mutableSetOf<Int>()
-        val matchedTracks = mutableSetOf<Int>()
+        val matchedTracks     = mutableSetOf<Int>()
+        val assignments       = mutableListOf<Pair<Int, Int>>() // trackIdx → detectionIdx
 
-        // 2. Greedy Centroid Matching
-        // In a real SORT we'd use Hungarian, but requirements specify Centroid matching.
-        val assignments = mutableListOf<Pair<Int, Int>>()
-        
-        // Calculate all distances
-        val distanceMatrix = Array(tracks.size) { tIdx ->
+        // 2. Build distance matrix
+        val distMatrix = Array(tracks.size) { tIdx ->
             FloatArray(detections.size) { dIdx ->
-                calculateDistance(tracks[tIdx].lastCx, tracks[tIdx].lastCy, 
-                                 detections[dIdx].bbox.centerX(), detections[dIdx].bbox.centerY())
+                euclidean(
+                    tracks[tIdx].lastCx, tracks[tIdx].lastCy,
+                    detections[dIdx].bbox.centerX(), detections[dIdx].bbox.centerY()
+                )
             }
         }
 
+        // 3. Greedy minimum-distance matching
         while (true) {
-            var minDistance = distanceThreshold
+            var minDist = distanceThreshold
             var bestT = -1
             var bestD = -1
 
@@ -67,104 +80,76 @@ class SortTracker {
                 if (t in matchedTracks) continue
                 for (d in detections.indices) {
                     if (d in matchedDetections) continue
-                    if (distanceMatrix[t][d] < minDistance) {
-                        minDistance = distanceMatrix[t][d]
+                    if (distMatrix[t][d] < minDist) {
+                        minDist = distMatrix[t][d]
                         bestT = t
                         bestD = d
                     }
                 }
             }
 
-            if (bestT != -1) {
-                matchedTracks.add(bestT)
-                matchedDetections.add(bestD)
-                assignments.add(bestT to bestD)
-            } else {
-                break
-            }
+            if (bestT == -1) break
+            matchedTracks.add(bestT)
+            matchedDetections.add(bestD)
+            assignments.add(bestT to bestD)
         }
 
-        // 3. Update Matched Tracks
+        // 4. Update matched tracks
         for ((tIdx, dIdx) in assignments) {
             val track = tracks[tIdx]
-            val detection = detections[dIdx]
-            
-            val newCx = detection.bbox.centerX()
-            val newCy = detection.bbox.centerY()
-            
-            // Pin Fall Logic (classIndex 1)
-            if (track.classIndex == 1 && track.state == State.STANDING) {
-                val ratio = detection.bbox.width() / detection.bbox.height()
-                val movement = calculateDistance(track.lastCx, track.lastCy, newCx, newCy)
-                
-                if (ratio > 1.0f || movement > fallMovementThreshold) {
-                    track.state = State.FALLEN
-                    currentFallCount++
-                    track.fallOrder = currentFallCount
-                    AppLog.i("PIN FELL! ID: ${track.id}, Order: $currentFallCount, Ratio: $ratio")
-                }
-            }
+            val det   = detections[dIdx]
+            val newCx = det.bbox.centerX()
+            val newCy = det.bbox.centerY()
 
-            // Car Trajectory Logic (classIndex 3)
+            // Append trajectory for the car
             if (track.classIndex == 3) {
                 track.trajectory.add(PointF(newCx, newCy))
-                if (track.trajectory.size > 200) track.trajectory.removeAt(0)
+                if (track.trajectory.size > 300) track.trajectory.removeAt(0)
             }
 
-            track.bbox = detection.bbox
+            track.bbox  = det.bbox
             track.lastCx = newCx
             track.lastCy = newCy
-            track.age = 0
+            track.age   = 0
         }
 
-        // 4. Create New Tracks
+        // 5. Create new tracks for unmatched detections
         for (dIdx in detections.indices) {
-            if (dIdx !in matchedDetections) {
-                val det = detections[dIdx]
-                val newTrack = TrackedObject(
-                    id = nextId.getAndIncrement(),
-                    classIndex = det.classIndex,
-                    bbox = det.bbox,
-                    lastCx = det.bbox.centerX(),
-                    lastCy = det.bbox.centerY()
-                )
-                
-                // If it's a car, start trajectory
-                if (newTrack.classIndex == 3) {
-                    newTrack.trajectory.add(PointF(newTrack.lastCx, newTrack.lastCy))
-                }
-                
-                // Initial state check for pins
-                if (newTrack.classIndex == 1) {
-                    val ratio = det.bbox.width() / det.bbox.height()
-                    if (ratio > 1.0f) {
-                        newTrack.state = State.FALLEN
-                        // Not incrementing fallOrder here because we didn't see it fall? 
-                        // Or maybe we should if we want to count all fallen pins.
-                        // "Assign it a fallOrder... and lock its state" implies seeing transition.
-                    }
-                }
-
-                tracks.add(newTrack)
-                AppLog.d("New track created: ID=${newTrack.id}, Class=${newTrack.classIndex}")
+            if (dIdx in matchedDetections) continue
+            val det = detections[dIdx]
+            val cx  = det.bbox.centerX()
+            val cy  = det.bbox.centerY()
+            val newTrack = TrackedObject(
+                id         = nextId.getAndIncrement(),
+                classIndex = det.classIndex,
+                bbox       = det.bbox,
+                lastCx     = cx,
+                lastCy     = cy
+            )
+            if (newTrack.classIndex == 3) {
+                newTrack.trajectory.add(PointF(cx, cy))
             }
+            tracks.add(newTrack)
+            AppLog.d("SortTracker: new track ID=${newTrack.id} class=${newTrack.classIndex}")
         }
 
-        // 5. Cleanup Dead Tracks
+        // 6. Purge dead tracks
         tracks.removeAll { it.age > maxAge }
 
         return tracks.toList()
     }
 
-    private fun calculateDistance(x1: Float, y1: Float, x2: Float, y2: Float): Float {
-        val dx = x1 - x2
-        val dy = y1 - y2
-        return sqrt(dx * dx + dy * dy)
-    }
-
     fun reset() {
         tracks.clear()
         nextId.set(1)
-        currentFallCount = 0
+        AppLog.i("SortTracker: reset.")
+    }
+
+    // --- Math ---
+
+    private fun euclidean(x1: Float, y1: Float, x2: Float, y2: Float): Float {
+        val dx = x1 - x2
+        val dy = y1 - y2
+        return sqrt(dx * dx + dy * dy)
     }
 }

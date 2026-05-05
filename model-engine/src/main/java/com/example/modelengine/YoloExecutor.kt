@@ -13,6 +13,7 @@ import java.util.Collections
  * Executes YOLOv8 models using ONNX Runtime.
  * Handles preprocessing, inference, output parsing, NMS, and coordinate scaling.
  */
+
 class YoloExecutor(context: Context, modelPath: String) {
 
     data class Detection(
@@ -20,7 +21,7 @@ class YoloExecutor(context: Context, modelPath: String) {
         val classIndex: Int,
         val confidence: Float
     )
-
+    private val CONFIDENCE_THRESHOLD = 0.45f
     private val env: OrtEnvironment = OrtEnvironment.getEnvironment()
     private val session: OrtSession
 
@@ -46,83 +47,77 @@ class YoloExecutor(context: Context, modelPath: String) {
      */
     fun detect(bitmap: Bitmap): List<Detection> {
         val startTime = System.currentTimeMillis()
-        
-        // 1. Preprocessing
+
+        // 1. Preprocessing — unchanged
         val resizedBitmap = if (bitmap.width == inputSize && bitmap.height == inputSize) {
             bitmap
         } else {
             Bitmap.createScaledBitmap(bitmap, inputSize, inputSize, true)
         }
-        
         bitmapToFloatArray(resizedBitmap)
         if (resizedBitmap != bitmap) resizedBitmap.recycle()
 
-        val inputTensor = OnnxTensor.createTensor(env, FloatBuffer.wrap(floatArray), longArrayOf(1, 3, 640, 640))
+        val inputTensor = OnnxTensor.createTensor(
+            env, FloatBuffer.wrap(floatArray), longArrayOf(1, 3, 640, 640)
+        )
 
-        // 2. Inference
-        val results = session.run(Collections.singletonMap(session.inputNames.iterator().next(), inputTensor))
+        // 2. Inference — unchanged
+        val results     = session.run(Collections.singletonMap(session.inputNames.iterator().next(), inputTensor))
         val outputTensor = results[0] as OnnxTensor
-        val outputShape = outputTensor.info.shape // e.g., [1, 8, 8400]
-        val outputData = outputTensor.floatBuffer.array()
+        val outputShape  = outputTensor.info.shape   // [1, 300, 6]
+        val outputData   = outputTensor.floatBuffer.array()
 
-        // 3. Parsing (YOLOv8 output: [1, numRows, numColumns])
-        // numRows = 4 (bbox) + numClasses
-        val detections = mutableListOf<Detection>()
-        val numRows = outputShape[1].toInt()
-        val numColumns = outputShape[2].toInt()
-        val numClasses = numRows - 4
+        AppLog.i("YoloExecutor: output tensor shape = [${outputShape.joinToString(", ")}]")
 
-        for (c in 0 until numColumns) {
-            var maxConf = 0f
-            var maxClass = -1
-            
-            for (classIdx in 0 until numClasses) {
-                val conf = outputData[numColumns * (4 + classIdx) + c]
-                if (conf > maxConf) {
-                    maxConf = conf
-                    maxClass = classIdx
-                }
-            }
+        // 3. Parsing — REWRITTEN for post-NMS format [1, numSlots, 6]
+        //
+        // This model was exported with NMS already applied.
+        // Each row i represents one detection:
+        //   [x1, y1, x2, y2, confidence, class_id]
+        // Coordinates are in the 640x640 input space and must be scaled back.
+        // Empty slots have confidence ≈ 0 and are filtered out.
+        //
+        // The old parser assumed raw YOLOv8 format [1, 4+classes, 8400] which
+        // is completely wrong for this model — it was reading x-coordinates as
+        // confidence scores, producing values in the hundreds.
 
-            if (maxConf > 0.45f) {
-                val cx = outputData[c]
-                val cy = outputData[numColumns + c]
-                val w = outputData[2 * numColumns + c]
-                val h = outputData[3 * numColumns + c]
+        val numSlots = outputShape[1].toInt()   // 300
+        val numFields = outputShape[2].toInt()  // 6  →  x1,y1,x2,y2,conf,cls
 
-                val left = (cx - w / 2f)
-                val top = (cy - h / 2f)
-                val right = (cx + w / 2f)
-                val bottom = (cy + h / 2f)
-
-                detections.add(Detection(RectF(left, top, right, bottom), maxClass, maxConf))
-            }
-        }
-
-        // 4. Non-Maximum Suppression
-        val nmsDetections = applyNMS(detections)
-
-        // 5. Scale coordinates back to original bitmap size
-        val scaleX = bitmap.width.toFloat() / inputSize
+        val scaleX = bitmap.width.toFloat()  / inputSize
         val scaleY = bitmap.height.toFloat() / inputSize
-        
-        val finalDetections = nmsDetections.map { det ->
-            val scaledBbox = RectF(
-                det.bbox.left * scaleX,
-                det.bbox.top * scaleY,
-                det.bbox.right * scaleX,
-                det.bbox.bottom * scaleY
+
+        val detections = mutableListOf<Detection>()
+
+        for (i in 0 until numSlots) {
+            val base = i * numFields
+
+            val conf  = outputData[base + 4]
+            if (conf < CONFIDENCE_THRESHOLD) continue   // skip empty / low-confidence slots
+
+            val clsId = outputData[base + 5].toInt()
+            if (clsId !in 0..3) continue                // guard against out-of-range class ids
+
+            val x1 = outputData[base + 0] * scaleX
+            val y1 = outputData[base + 1] * scaleY
+            val x2 = outputData[base + 2] * scaleX
+            val y2 = outputData[base + 3] * scaleY
+
+            detections.add(Detection(RectF(x1, y1, x2, y2), clsId, conf))
+
+            AppLog.d(
+                "YoloExecutor: slot[$i] cls=$clsId conf=${"%.2f".format(conf)} " +
+                        "bbox=(${x1.toInt()},${y1.toInt()},${x2.toInt()},${y2.toInt()})"
             )
-            det.copy(bbox = scaledBbox)
         }
 
-        val endTime = System.currentTimeMillis()
-        AppLog.metric("InferenceTime", endTime - startTime)
-        AppLog.d("Detected ${finalDetections.size} objects after NMS.")
-        
-        return finalDetections
-    }
+        // 4. No NMS — model already applied it. Skip applyNMS().
 
+        AppLog.metric("InferenceTime", System.currentTimeMillis() - startTime)
+        AppLog.d("Detected ${detections.size} objects after post-NMS parsing.")
+
+        return detections
+    }
     private fun bitmapToFloatArray(bitmap: Bitmap) {
         bitmap.getPixels(pixels, 0, bitmap.width, 0, 0, bitmap.width, bitmap.height)
         

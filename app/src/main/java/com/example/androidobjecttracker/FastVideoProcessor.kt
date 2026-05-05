@@ -42,16 +42,24 @@ class FastVideoProcessor(
             for (i in 0 until totalFrames step step) {
                 val timeUs = (i.toLong() * durationMs * 1000L) / totalFrames
                 val bitmap = retriever.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
-                
+
                 if (bitmap != null) {
-                    // 1. Run inference and tracking
                     val tracks = modelExecutor.detectAndTrack(bitmap)
-                    
-                    // 2. Encode frame with annotations
-                    // Use a more memory-efficient way to get a mutable bitmap if needed
-                    val mutableBitmap = if (bitmap.isMutable) bitmap else bitmap.copy(Bitmap.Config.ARGB_8888, true)
+
+                    val mutableBitmap = if (bitmap.isMutable) bitmap
+                    else bitmap.copy(Bitmap.Config.ARGB_8888, true)
                     if (mutableBitmap != bitmap) bitmap.recycle()
-                    
+
+                    try {
+                        videoEncoder.encodeFrame(mutableBitmap, tracks)
+                    } catch (e: Exception) {
+                        AppLog.e("FastVideoProcessor: encodeFrame threw on frame $i, skipping", e)
+                    } finally {
+                        mutableBitmap.recycle()
+                    }
+
+                    // ... progress reporting unchanged
+
                     videoEncoder.encodeFrame(mutableBitmap, tracks)
                     mutableBitmap.recycle()
                     

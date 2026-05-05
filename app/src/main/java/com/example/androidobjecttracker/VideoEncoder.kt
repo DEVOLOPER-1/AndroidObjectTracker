@@ -77,15 +77,14 @@ class VideoEncoder(private val context: Context) {
      * Bakes annotations into the bitmap and sends it to the encoder.
      */
     fun encodeFrame(bitmap: Bitmap, tracks: List<SortTracker.TrackedObject>) {
-        val codec = this.codec ?: return
         val surface = this.inputSurface ?: return
 
+        // Draw annotations directly onto the bitmap first
         val canvas = Canvas(bitmap)
-        
+
         tracks.forEach { track ->
             when (track.classIndex) {
-                3 -> { // Car
-                    // 1. Draw trajectory path
+                3 -> {
                     if (track.trajectory.size > 1) {
                         val path = Path()
                         path.moveTo(track.trajectory[0].x, track.trajectory[0].y)
@@ -94,31 +93,52 @@ class VideoEncoder(private val context: Context) {
                         }
                         canvas.drawPath(path, carPathPaint)
                     }
-                    // 2. Label car
-                    canvas.drawText("CAR ID:${track.id}", track.lastCx, track.lastCy - 20f, textPaint)
+                    canvas.drawText(
+                        "CAR ID:${track.id}",
+                        track.lastCx, track.lastCy - 20f,
+                        textPaint
+                    )
                 }
-                1 -> { // Pins
+                1 -> {
                     if (track.state == SortTracker.State.FALLEN) {
-                        // Fallen Pin: Red box + Fall Order
                         pinPaint.color = Color.RED
                         canvas.drawRect(track.bbox, pinPaint)
                         track.fallOrder?.let { order ->
-                            canvas.drawText("#$order", track.bbox.centerX(), track.bbox.centerY(), textPaint)
+                            canvas.drawText(
+                                "#$order",
+                                track.bbox.centerX(), track.bbox.centerY(),
+                                textPaint
+                            )
                         }
                     } else {
-                        // Standing Pin: Green box
                         pinPaint.color = Color.GREEN
                         canvas.drawRect(track.bbox, pinPaint)
-                        canvas.drawText("PIN", track.bbox.left, track.bbox.top - 10f, textPaint)
+                        canvas.drawText(
+                            "PIN",
+                            track.bbox.left, track.bbox.top - 10f,
+                            textPaint
+                        )
                     }
                 }
             }
         }
 
-        // Send to Surface
-        val displayCanvas = surface.lockHardwareCanvas()
-        displayCanvas.drawBitmap(bitmap, 0f, 0f, null)
-        surface.unlockCanvasAndPost(displayCanvas)
+        // Send annotated bitmap to encoder surface.
+        // lockCanvas(null) is used instead of lockHardwareCanvas() because
+        // lockHardwareCanvas() throws a native EGL crash on Exynos/Samsung
+        // devices when the encoder surface is not hardware-canvas compatible.
+        val surfaceCanvas = try {
+            surface.lockCanvas(null)
+        } catch (e: Exception) {
+            AppLog.e("VideoEncoder: lockCanvas failed, skipping frame $frameCount", e)
+            return
+        }
+
+        try {
+            surfaceCanvas.drawBitmap(bitmap, 0f, 0f, null)
+        } finally {
+            surface.unlockCanvasAndPost(surfaceCanvas)
+        }
 
         drainEncoder(false)
         frameCount++
