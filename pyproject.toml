@@ -1,0 +1,14 @@
+[project]
+name = "android-object-tracker"
+version = "0.1.0"
+description = "Android object tracking project"
+requires-python = ">=3.10"
+dependencies = [
+  "onnxruntime>=1.24.3",
+  "opencv-python-headless>=4.13.0.92",
+  "tqdm>=4.67.3",
+]
+
+[build-system]
+requires = ["uv_build>=0.8.0,<0.9.0"]
+build-backend = "uv_build"
