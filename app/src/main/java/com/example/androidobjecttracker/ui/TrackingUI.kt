@@ -1,29 +1,27 @@
 package com.example.androidobjecttracker.ui
 
-import android.graphics.Bitmap
-import android.graphics.PointF
 import android.net.Uri
 import android.widget.VideoView
 import androidx.camera.view.PreviewView
-import androidx.compose.foundation.Canvas
-import androidx.compose.foundation.Image
+import androidx.compose.animation.*
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.Path
-import androidx.compose.ui.graphics.asImageBitmap
-import androidx.compose.ui.graphics.drawscope.Stroke
-import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
-import com.example.modelengine.SortTracker
 
 enum class AppState {
     IDLE, RECORDING, PROCESSING, RESULTS
@@ -33,43 +31,33 @@ enum class AppState {
 fun TrackingScreen(
     appState: AppState,
     previewView: PreviewView?,
-    currentFrame: Bitmap?,
     resultVideoUri: Uri?,
-    processingProgress: Float,
-    processingEtaMs: Long,
-    pins: List<SortTracker.TrackedObject>,
-    carPath: List<PointF>,
-    finalStats: Pair<Long, Int>?,
     onRecordToggle: () -> Unit,
-    onPickVideo: () -> Unit,
-    onSaveResult: () -> Unit,
     onReset: () -> Unit
 ) {
-    Box(modifier = Modifier.fillMaxSize()) {
-        when (appState) {
-            AppState.IDLE, AppState.RECORDING -> {
-                CameraCaptureView(previewView, appState == AppState.RECORDING, onRecordToggle, onPickVideo)
-            }
-            AppState.PROCESSING -> {
-                ProcessingView(processingProgress, processingEtaMs)
-            }
-            AppState.RESULTS -> {
-                ResultsView(currentFrame, resultVideoUri, pins, carPath, finalStats, onSaveResult, onReset)
+    MaterialTheme(
+        colorScheme = darkColorScheme(
+            primary = Color(0xFF00E676),
+            secondary = Color(0xFF00B0FF),
+            background = Color(0xFF121212),
+            surface = Color(0xFF1E1E1E)
+        )
+    ) {
+        Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
+            Box(modifier = Modifier.fillMaxSize()) {
+                when (appState) {
+                    AppState.IDLE, AppState.RECORDING -> {
+                        CameraCaptureView(previewView, appState == AppState.RECORDING, onRecordToggle)
+                    }
+                    AppState.PROCESSING -> {
+                        ProcessingView()
+                    }
+                    AppState.RESULTS -> {
+                        ResultsView(resultVideoUri, onReset)
+                    }
+                }
             }
         }
-    }
-}
-
-@Composable
-fun Label(text: String, x: Float, y: Float, color: Color) {
-    val density = androidx.compose.ui.platform.LocalDensity.current.density
-    Box(
-        modifier = Modifier
-            .offset(x = (x / density).dp, y = (y / density).dp)
-            .background(Color.Black.copy(alpha = 0.6f), RoundedCornerShape(4.dp))
-            .padding(horizontal = 4.dp, vertical = 2.dp)
-    ) {
-        Text(text = text, color = color, fontSize = 10.sp, fontWeight = androidx.compose.ui.text.font.FontWeight.Bold)
     }
 }
 
@@ -77,74 +65,107 @@ fun Label(text: String, x: Float, y: Float, color: Color) {
 fun CameraCaptureView(
     previewView: PreviewView?,
     isRecording: Boolean,
-    onRecordToggle: () -> Unit,
-    onPickVideo: () -> Unit
+    onRecordToggle: () -> Unit
 ) {
     Box(modifier = Modifier.fillMaxSize()) {
         if (previewView != null) {
             AndroidView(factory = { previewView }, modifier = Modifier.fillMaxSize())
         }
-        
+
+        // Overlay Gradient
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(
+                    Brush.verticalGradient(
+                        colors = listOf(Color.Transparent, Color.Black.copy(alpha = 0.4f)),
+                        startY = 500f
+                    )
+                )
+        )
+
         Column(
             modifier = Modifier
                 .align(Alignment.BottomCenter)
-                .padding(bottom = 48.dp),
+                .padding(bottom = 64.dp),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
-            if (!isRecording) {
-                Button(onClick = onPickVideo, colors = ButtonDefaults.buttonColors(containerColor = Color.White, contentColor = Color.Black)) {
-                    Text("PICK FROM GALLERY")
-                }
+            if (isRecording) {
+                Text(
+                    "REC",
+                    color = Color.Red,
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 18.sp,
+                    modifier = Modifier
+                        .background(Color.Black.copy(alpha = 0.5f), RoundedCornerShape(4.dp))
+                        .padding(horizontal = 12.dp, vertical = 4.dp)
+                )
                 Spacer(modifier = Modifier.height(16.dp))
             }
-            
-            IconButton(
-                onClick = onRecordToggle,
+
+            Box(
+                contentAlignment = Alignment.Center,
                 modifier = Modifier
-                    .size(80.dp)
-                    .background(Color.White, CircleShape)
-                    .padding(4.dp)
-                    .background(Color.Black, CircleShape)
-                    .padding(2.dp)
-                    .background(if (isRecording) Color.Red else Color.White, CircleShape)
-            ) {}
-            
-            if (isRecording) {
-                Text("RECORDING...", color = Color.Red, modifier = Modifier.padding(top = 8.dp), style = MaterialTheme.typography.labelLarge)
+                    .size(88.dp)
+                    .clip(CircleShape)
+                    .background(Color.White.copy(alpha = 0.2f))
+                    .padding(8.dp)
+            ) {
+                IconButton(
+                    onClick = onRecordToggle,
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .clip(CircleShape)
+                        .background(if (isRecording) Color.Red else Color.White)
+                ) {
+                    // Central icon or shape could go here
+                }
             }
+            
+            Spacer(modifier = Modifier.height(16.dp))
+            Text(
+                if (isRecording) "Stop Recording" else "Start Recording",
+                color = Color.White,
+                fontWeight = FontWeight.Medium
+            )
         }
     }
 }
 
 @Composable
-fun ProcessingView(progress: Float, etaMs: Long) {
-    Box(modifier = Modifier.fillMaxSize().background(Color.Black), contentAlignment = Alignment.Center) {
+fun ProcessingView() {
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color.Black.copy(alpha = 0.9f)),
+        contentAlignment = Alignment.Center
+    ) {
         Column(horizontalAlignment = Alignment.CenterHorizontally) {
-            CircularProgressIndicator(progress = { progress }, color = Color.Cyan, strokeWidth = 6.dp, modifier = Modifier.size(100.dp))
-            Spacer(modifier = Modifier.height(24.dp))
-            Text("PROCESSING VIDEO...", color = Color.White, style = MaterialTheme.typography.headlineSmall)
-            Text("${(progress * 100).toInt()}%", color = Color.Cyan, modifier = Modifier.padding(top = 8.dp))
-            
-            if (etaMs > 0) {
-                Text(
-                    text = "Estimated time remaining: ${etaMs / 1000}s",
-                    color = Color.White.copy(alpha = 0.7f),
-                    modifier = Modifier.padding(top = 16.dp),
-                    style = MaterialTheme.typography.bodyMedium
-                )
-            }
+            CircularProgressIndicator(
+                color = MaterialTheme.colorScheme.primary,
+                strokeWidth = 6.dp,
+                modifier = Modifier.size(80.dp)
+            )
+            Spacer(modifier = Modifier.height(32.dp))
+            Text(
+                "SENT TO TERMUX",
+                style = MaterialTheme.typography.headlineSmall,
+                color = Color.White,
+                fontWeight = FontWeight.Bold
+            )
+            Spacer(modifier = Modifier.height(8.dp))
+            Text(
+                "Waiting for processed video...",
+                color = Color.Gray,
+                style = MaterialTheme.typography.bodyLarge
+            )
         }
     }
 }
 
 @Composable
 fun ResultsView(
-    frame: Bitmap?,
     videoUri: Uri?,
-    pins: List<SortTracker.TrackedObject>,
-    carPath: List<PointF>,
-    stats: Pair<Long, Int>?,
-    onSave: () -> Unit,
     onReset: () -> Unit
 ) {
     Box(modifier = Modifier.fillMaxSize().background(Color.Black)) {
@@ -159,47 +180,29 @@ fun ResultsView(
                 },
                 modifier = Modifier.fillMaxSize()
             )
-        } else if (frame != null) {
-            Image(
-                bitmap = frame.asImageBitmap(),
-                contentDescription = null,
-                modifier = Modifier.fillMaxSize(),
-                contentScale = ContentScale.Fit
-            )
-        }
-
-        // Top Stats Overlay
-        stats?.let { (time, count) ->
-            Column(
-                modifier = Modifier
-                    .padding(16.dp)
-                    .background(Color.Black.copy(0.7f), RoundedCornerShape(8.dp))
-                    .padding(12.dp)
-            ) {
-                Text("Run Time: ${time / 1000}s", color = Color.White)
-                Text("Pins Hit: $count", color = Color.Yellow, style = MaterialTheme.typography.titleLarge)
+        } else {
+            Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                Text("Video Ready!", color = Color.White)
             }
         }
 
-        // Bottom Actions
-        Row(
+        // Action Buttons Overlay
+        Column(
             modifier = Modifier
                 .align(Alignment.BottomCenter)
                 .padding(32.dp)
                 .fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceEvenly
+            horizontalAlignment = Alignment.CenterHorizontally
         ) {
             Button(
                 onClick = onReset,
-                colors = ButtonDefaults.buttonColors(containerColor = Color.Gray)
+                shape = RoundedCornerShape(12.dp),
+                modifier = Modifier.height(56.dp).fillMaxWidth(0.6f),
+                colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary)
             ) {
-                Text("RESTART")
-            }
-            Button(
-                onClick = onSave,
-                colors = ButtonDefaults.buttonColors(containerColor = Color.Cyan, contentColor = Color.Black)
-            ) {
-                Text("SAVE VIDEO")
+                Icon(Icons.Default.Refresh, contentDescription = null)
+                Spacer(modifier = Modifier.width(8.dp))
+                Text("RECORD AGAIN", fontWeight = FontWeight.Bold)
             }
         }
     }

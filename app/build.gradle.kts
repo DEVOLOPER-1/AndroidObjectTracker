@@ -37,7 +37,6 @@ android {
 }
 
 dependencies {
-    implementation(project(":model-engine"))
 
     implementation(platform(libs.androidx.compose.bom))
     implementation(libs.androidx.ui)
