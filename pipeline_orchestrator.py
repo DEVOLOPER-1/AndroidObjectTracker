@@ -45,6 +45,8 @@ class PipelineConfig:
     trail_min_alpha: float = 0.25
     show_pin_roi: bool = False   # draw the fall-detection ROI boxes (debug)
     show_score: bool = True      # show score overlay with elapsed time + pin count
+    nms_score_threshold: float = 0.25   # YOLO confidence filter (before NMS) — try 0.35-0.50 for stricter
+    nms_iou_threshold: float = 0.45     # Overlap tolerance in NMS — lower (0.25-0.35) = more aggressive
 
 
 def _xyxy_to_xywh(box: tuple[float, float, float, float]) -> list[int]:
@@ -74,6 +76,11 @@ def run_pipeline(config: PipelineConfig) -> Path:
 
     # ── Build trackers ───────────────────────────────────────────────────────
     yolo = YOLOTracker()
+
+    # ── Apply NMS thresholds from config ──────────────────────────────────
+    yolo.nms_score_threshold = config.nms_score_threshold
+    yolo.nms_iou_threshold = config.nms_iou_threshold
+    print(f"[Pipeline] NMS thresholds: score={config.nms_score_threshold}, iou={config.nms_iou_threshold}")
 
     pin_tracker = PinFallTracker()
 
@@ -158,6 +165,9 @@ def run_pipeline(config: PipelineConfig) -> Path:
 
     total_frames   = int(cap.get(cv.CAP_PROP_FRAME_COUNT) or 0)
     progress_total = total_frames if total_frames > 0 else None
+    frames_70_percent = max(1, int(total_frames * 0.7)) if total_frames > 0 else 1
+    detected_pin_track_ids: set[int] = set()  # Track unique pin track_ids across 70% of video
+
     pbar = tqdm(
         total=progress_total,
         desc=f"Tracking {config.video_path.name}",
@@ -221,6 +231,11 @@ def run_pipeline(config: PipelineConfig) -> Path:
                 frame_index=frame_index,
             )
 
+            # ── Track unique pins detected in first 70% of video ──────────────
+            if frame_index < frames_70_percent:
+                for pin in pin_states:
+                    detected_pin_track_ids.add(pin.track_id)
+
             # ── Compose annotated frame ────────────────────────────────────
             elapsed = time.time() - pipeline_start_time
             annotated = annotation_renderer.annotate_tracking_frame(
@@ -248,10 +263,21 @@ def run_pipeline(config: PipelineConfig) -> Path:
         # ── Final stats ────────────────────────────────────────────────────
         total_elapsed = time.time() - pipeline_start_time
         fallen = pin_tracker.fallen_count()
+        max_pins_detected = len(detected_pin_track_ids)
         fallen_pins = sorted([p for p in pin_tracker.get_pins() if p.is_fallen], key=lambda p: p.fall_order)
+
+        # ── SANITY CHECK: Fallen count can't exceed detected pins ──────────
+        if fallen > max_pins_detected:
+            print(
+                f"\n[WARNING] Sanity check failed: {fallen} pins marked as fallen, "
+                f"but only {max_pins_detected} unique pins detected in first 70% of video."
+            )
+            fallen = max_pins_detected  # Cap to detected count
+
         print(
             f"\n[Pipeline] Done in {total_elapsed:.1f}s — "
-            f"{fallen}/{len(pin_tracker.get_pins())} pins knocked down"
+            f"{fallen}/{max_pins_detected} pins knocked down "
+            f"(detected: {max_pins_detected}, total tracked: {len(pin_tracker.get_pins())})"
         )
         if fallen_pins:
             order_str = " → ".join(

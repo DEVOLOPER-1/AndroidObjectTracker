@@ -315,6 +315,16 @@ def main() -> int:
     parser.add_argument("--max-search-frames", type=int, default=600)
     parser.add_argument("--show-pin-roi",    action="store_true")
     parser.add_argument("--no-score",        action="store_true")
+    parser.add_argument(
+        "--nms-score-threshold", type=float, default=0.25,
+        help="YOLO confidence threshold (0.0-1.0). Higher filters low-confidence boxes. "
+             "Try 0.35-0.50 for stricter, 0.10-0.20 for lenient. Default: 0.25"
+    )
+    parser.add_argument(
+        "--nms-iou-threshold", type=float, default=0.45,
+        help="NMS IoU overlap threshold (0.0-1.0). Lower=more aggressive dedup (0.25-0.35), "
+             "Higher=more lenient (0.55-0.65). Default: 0.45"
+    )
     args = parser.parse_args()
 
     config = PipelineConfig(
@@ -328,6 +338,8 @@ def main() -> int:
         trail_min_alpha=args.trail_min_alpha,
         show_pin_roi=args.show_pin_roi,
         show_score=not args.no_score,
+        nms_score_threshold=args.nms_score_threshold,
+        nms_iou_threshold=args.nms_iou_threshold,
     )
     output_path = run_pipeline(config)
     print(f"Saved tracked video to: {output_path}")

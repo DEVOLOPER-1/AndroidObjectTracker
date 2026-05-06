@@ -203,7 +203,74 @@ class YOLOTracker:
 		score_threshold: float = 0.25,
 		iou_threshold: float = 0.45,
 	) -> list[Detection]:
-		"""Apply OpenCV-native NMS for efficient deduplication."""
+		"""
+		Apply OpenCV-native NMS (Non-Maximum Suppression) for efficient deduplication.
+
+		NMS Parameter Tuning Guide
+		==========================
+
+		Two main parameters control NMS behavior:
+
+		1. **score_threshold** (confidence threshold)
+		   ────────────────────────────────────────
+		   - Default: 0.25
+		   - Range: [0.0, 1.0]
+		   - Effect: Filters out detections with confidence BELOW this threshold BEFORE NMS
+		   - Higher values → fewer low-confidence boxes → cleaner output but may miss objects
+		   - Lower values → more low-confidence boxes → noisier but less missed detections
+
+		   Tuning recommendations:
+		   - If you see many spurious boxes around pins: INCREASE to 0.35-0.50
+		   - If car/pins are being missed: DECREASE to 0.15-0.20
+		   - For strict deduplication: Start at 0.30-0.40
+
+		2. **iou_threshold** (IoU overlap threshold)
+		   ────────────────────────────────────────
+		   - Default: 0.45
+		   - Range: [0.0, 1.0]
+		   - Effect: Removes overlapping boxes with IoU > threshold
+		   - Lower values (e.g., 0.25-0.35) → MORE AGGRESSIVE (remove more overlaps)
+		   - Higher values (e.g., 0.55-0.75) → LENIENT (keep more overlaps)
+
+		   Tuning recommendations:
+		   - If multiple boxes on same pin: DECREASE to 0.25-0.35
+		   - If boxes are too aggressively merged: INCREASE to 0.55-0.65
+		   - For bowling pins (distinct objects): Use 0.35-0.45 (default is good)
+
+		Combined tuning examples:
+		────────────────────────
+		STRICT (fewest boxes, highest precision):
+		  score_threshold=0.40, iou_threshold=0.30
+		  → Filters low-confidence + aggressively removes overlaps
+		  → Pro: Very clean output, minimal ghosting
+		  → Con: May miss some detections
+
+		BALANCED (recommended default):
+		  score_threshold=0.25, iou_threshold=0.45
+		  → Moderate confidence filter + moderate overlap removal
+		  → Pro: Good balance between precision and recall
+		  → Con: May need tuning per video
+
+		LENIENT (most boxes, highest recall):
+		  score_threshold=0.10, iou_threshold=0.60
+		  → Keeps low-confidence boxes + tolerates overlaps
+		  → Pro: Catches more objects including marginal detections
+		  → Con: Noisier output, potential ghosting
+
+		Debugging steps:
+		────────────────
+		1. If seeing 2-4 boxes around each pin:
+		   - Decrease iou_threshold (e.g., 0.45 → 0.35)
+		   - OR increase score_threshold (e.g., 0.25 → 0.40)
+
+		   2. If car is missing or pins disappear:
+		   - Increase iou_threshold (e.g., 0.45 → 0.55)
+		   - OR decrease score_threshold (e.g., 0.25 → 0.15)
+
+		3. If ghosting persists even after tuning:
+		   - Check YOLOTracker output confidence levels
+		   - Consider downstream filtering in pipeline.py
+		"""
 		if len(detections) <= 1:
 			return detections
 
