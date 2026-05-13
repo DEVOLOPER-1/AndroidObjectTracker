@@ -3,6 +3,10 @@ plugins {
     alias(libs.plugins.composeCompiler)
 }
 
+base {
+    archivesName.set("PinTrackerPro")
+}
+
 android {
     namespace = "com.example.androidobjecttracker"
     compileSdk = 36

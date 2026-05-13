@@ -241,6 +241,17 @@ fun CameraCaptureView(
                 .padding(bottom = 64.dp),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
+            if (!isRecording) {
+                Text(
+                    "PIN TRACKER PRO",
+                    style = MaterialTheme.typography.headlineMedium,
+                    color = Color.White,
+                    fontWeight = FontWeight.ExtraBold,
+                    letterSpacing = 4.sp,
+                    modifier = Modifier.padding(bottom = 32.dp)
+                )
+            }
+
             if (isRecording) {
                 Text(
                     "REC",
@@ -296,7 +307,7 @@ fun ProcessingView(progress: Float) {
             )
             
             Text(
-                "IN-APP INFERENCE",
+                "AI ANALYSIS IN PROGRESS",
                 style = MaterialTheme.typography.titleLarge,
                 color = Color.White,
                 fontWeight = FontWeight.Bold,
@@ -304,14 +315,14 @@ fun ProcessingView(progress: Float) {
             )
             
             Text(
-                "Running YOLO Tracker: ${(progress * 100).toInt()}%",
+                "Analyzing Pin Physics: ${(progress * 100).toInt()}%",
                 style = MaterialTheme.typography.bodyLarge,
                 color = Color(0xFF00E676),
                 fontWeight = FontWeight.Medium
             )
             
             Text(
-                "Processing locally on your device...",
+                "Applying Classical CV Engineering Pipeline...",
                 style = MaterialTheme.typography.bodySmall,
                 color = Color.Gray
             )
