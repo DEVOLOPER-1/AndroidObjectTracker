@@ -55,7 +55,7 @@ class YoloDetector(private val context: Context) {
                 val options = OrtSession.SessionOptions()
                 options.setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT)
                 // Exynos 7904 has 8 cores, set threads to avoid overwhelming if fallback happens
-                options.setIntraOpNumThreads(2) 
+                options.setIntraOpNumThreads(4)
                 
                 try {
                     // Attempt NNAPI with FP16 if supported
