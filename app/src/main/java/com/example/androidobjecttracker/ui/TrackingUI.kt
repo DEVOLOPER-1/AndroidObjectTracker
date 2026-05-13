@@ -1,209 +1,395 @@
 package com.example.androidobjecttracker.ui
 
-import android.graphics.RectF
+import android.net.Uri
+import android.widget.VideoView
 import androidx.camera.view.PreviewView
-import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
-import androidx.compose.foundation.gestures.detectDragGestures
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Refresh
-import androidx.compose.material3.Icon
-import androidx.compose.material3.IconButton
-import androidx.compose.material3.Text
+import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.drawscope.Stroke
-import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
+import com.example.androidobjecttracker.pipeline.PipelineParams
 
+enum class AppState {
+    IDLE, RECORDING, PROCESSING, RESULTS
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun TrackingScreen(
-    previewView: PreviewView,
-    trackedBboxes: Map<Int, RectF>,
-    fps: Int,
-    latency: Long,
-    isRecording: Boolean,
-    onRoiSelected: (RectF) -> Unit,
+    appState: AppState,
+    previewView: PreviewView?,
+    resultVideoUri: Uri?,
+    processingVideoUri: Uri?,
+    pipelineParams: PipelineParams,
+    processingProgress: Float,
+    onParamsChange: (PipelineParams) -> Unit,
+    onRecordToggle: () -> Unit,
     onReset: () -> Unit,
-    onToggleRecording: () -> Unit
+    onPickVideo: () -> Unit
 ) {
-    var selectionStart by remember { mutableStateOf<Offset?>(null) }
-    var selectionCurrent by remember { mutableStateOf<Offset?>(null) }
-    var isAddingObject by remember { mutableStateOf(false) }
+    var showSettings by remember { mutableStateOf(false) }
 
-    Box(modifier = Modifier.fillMaxSize()) {
-        // 1. Camera Preview (Bottom Layer)
-        AndroidView(
-            factory = { previewView },
-            modifier = Modifier.fillMaxSize()
+    MaterialTheme(
+        colorScheme = darkColorScheme(
+            primary = Color(0xFF00E676),
+            secondary = Color(0xFF00B0FF),
+            background = Color(0xFF121212),
+            surface = Color(0xFF1E1E1E)
         )
-
-        // 2. Drawing Layer (Middle Layer)
-        // This Canvas must be fillMaxSize and transparent
-        Canvas(
-            modifier = Modifier
-                .fillMaxSize()
-                .pointerInput(isAddingObject) {
-                    if (isAddingObject) {
-                        detectDragGestures(
-                            onDragStart = { offset ->
-                                selectionStart = offset
-                                selectionCurrent = offset
-                            },
-                            onDrag = { change, _ ->
-                                selectionCurrent = change.position
-                            },
-                            onDragEnd = {
-                                if (selectionStart != null && selectionCurrent != null) {
-                                    val rect = RectF(
-                                        minOf(selectionStart!!.x, selectionCurrent!!.x),
-                                        minOf(selectionStart!!.y, selectionCurrent!!.y),
-                                        maxOf(selectionStart!!.x, selectionCurrent!!.x),
-                                        maxOf(selectionStart!!.y, selectionCurrent!!.y)
-                                    )
-                                    if (rect.width() > 20 && rect.height() > 20) {
-                                        onRoiSelected(rect)
-                                        isAddingObject = false
-                                    }
-                                }
-                                selectionStart = null
-                                selectionCurrent = null
-                            }
+    ) {
+        Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
+            Box(modifier = Modifier.fillMaxSize()) {
+                when (appState) {
+                    AppState.IDLE, AppState.RECORDING -> {
+                        CameraCaptureView(
+                            previewView,
+                            appState == AppState.RECORDING,
+                            onRecordToggle,
+                            onPickVideo,
+                            onOpenSettings = { showSettings = true }
                         )
                     }
-                }
-        ) {
-            // Draw ROI Selector
-            val start = selectionStart
-            val current = selectionCurrent
-            if (isAddingObject && start != null && current != null) {
-                drawRect(
-                    color = Color.Yellow,
-                    topLeft = Offset(
-                        minOf(start.x, current.x),
-                        minOf(start.y, current.y)
-                    ),
-                    size = Size(
-                        kotlin.math.abs(current.x - start.x),
-                        kotlin.math.abs(current.y - start.y)
-                    ),
-                    style = Stroke(width = 2.dp.toPx())
-                )
-            }
-
-            // Draw Tracked Bounding Boxes
-            trackedBboxes.forEach { (id, bbox) ->
-                // Ensure coordinates are within canvas bounds
-                drawRect(
-                    color = getBoxColor(id),
-                    topLeft = Offset(bbox.left, bbox.top),
-                    size = Size(bbox.width(), bbox.height()),
-                    style = Stroke(width = 4.dp.toPx())
-                )
-            }
-        }
-
-        // 3. UI Controls and Info (Top Layer)
-        if (isAddingObject) {
-            Text(
-                text = "Draw a box around the object",
-                color = Color.Yellow,
-                modifier = Modifier
-                    .align(Alignment.TopCenter)
-                    .padding(top = 100.dp)
-                    .background(Color.Black.copy(alpha = 0.5f), RoundedCornerShape(4.dp))
-                    .padding(8.dp)
-            )
-        }
-
-        StatsOverlay(fps, latency)
-
-        Column(
-            modifier = Modifier
-                .align(Alignment.BottomCenter)
-                .padding(bottom = 32.dp),
-            horizontalAlignment = Alignment.CenterHorizontally
-        ) {
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(24.dp)
-            ) {
-                IconButton(
-                    onClick = {
-                        onReset()
-                        isAddingObject = false
-                    },
-                    modifier = Modifier
-                        .background(Color.DarkGray.copy(alpha = 0.7f), CircleShape)
-                        .size(56.dp)
-                ) {
-                    Icon(Icons.Default.Refresh, contentDescription = "Reset", tint = Color.White)
+                    AppState.PROCESSING -> {
+                        ProcessingView(processingVideoUri, processingProgress)
+                    }
+                    AppState.RESULTS -> {
+                        ResultsView(resultVideoUri, onReset)
+                    }
                 }
 
-                IconButton(
-                    onClick = onToggleRecording,
-                    modifier = Modifier
-                        .size(72.dp)
-                        .background(if (isRecording) Color.Red else Color.White, CircleShape)
-                        .padding(4.dp)
-                        .background(Color.Black, CircleShape)
-                        .padding(2.dp)
-                        .background(if (isRecording) Color.Red else Color.White, CircleShape)
-                ) {
-                }
-
-                IconButton(
-                    onClick = { isAddingObject = !isAddingObject },
-                    modifier = Modifier
-                        .background(if (isAddingObject) Color.Yellow else Color.DarkGray.copy(alpha = 0.7f), CircleShape)
-                        .size(56.dp)
-                ) {
-                    Icon(
-                        Icons.Default.Add, 
-                        contentDescription = "Add Object", 
-                        tint = if (isAddingObject) Color.Black else Color.White
+                if (showSettings) {
+                    SettingsSheet(
+                        params = pipelineParams,
+                        onDismiss = { showSettings = false },
+                        onSave = {
+                            onParamsChange(it)
+                            showSettings = false
+                        }
                     )
                 }
-            }
-            
-            if (isRecording) {
-                Text(
-                    text = "RECORDING",
-                    color = Color.Red,
-                    fontSize = 12.sp,
-                    modifier = Modifier.padding(top = 8.dp)
-                )
             }
         }
     }
 }
 
-fun getBoxColor(id: Int): Color {
-    val colors = listOf(Color.Green, Color.Cyan, Color.Magenta, Color.Yellow, Color.Red, Color.Blue)
-    return colors[id % colors.size]
+@Composable
+fun SettingsSheet(
+    params: PipelineParams,
+    onDismiss: () -> Unit,
+    onSave: (PipelineParams) -> Unit
+) {
+    var processEvery by remember { mutableStateOf(params.processEvery.toString()) }
+    var trailLength by remember { mutableStateOf(params.trailLength.toString()) }
+    var trailMinAlpha by remember { mutableStateOf(params.trailMinAlpha.toString()) }
+    var preferredClass by remember { mutableStateOf(params.preferredClass) }
+    var nmsScore by remember { mutableStateOf(params.nmsScoreThreshold.toString()) }
+    var nmsIou by remember { mutableStateOf(params.nmsIouThreshold.toString()) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Pipeline Settings") },
+        text = {
+            Column(
+                modifier = Modifier
+                    .verticalScroll(rememberScrollState())
+                    .padding(8.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                OutlinedTextField(
+                    value = preferredClass,
+                    onValueChange = { preferredClass = it },
+                    label = { Text("Preferred Class") },
+                    modifier = Modifier.fillMaxWidth()
+                )
+
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedTextField(
+                        value = processEvery,
+                        onValueChange = { processEvery = it },
+                        label = { Text("Process Every N") },
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                        modifier = Modifier.weight(1f)
+                    )
+                    OutlinedTextField(
+                        value = trailLength,
+                        onValueChange = { trailLength = it },
+                        label = { Text("Trail Length") },
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                        modifier = Modifier.weight(1f)
+                    )
+                }
+
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedTextField(
+                        value = trailMinAlpha,
+                        onValueChange = { trailMinAlpha = it },
+                        label = { Text("Min Alpha") },
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                        modifier = Modifier.weight(1f)
+                    )
+                    OutlinedTextField(
+                        value = nmsScore,
+                        onValueChange = { nmsScore = it },
+                        label = { Text("Score Thresh") },
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                        modifier = Modifier.weight(1f)
+                    )
+                }
+
+                OutlinedTextField(
+                    value = nmsIou,
+                    onValueChange = { nmsIou = it },
+                    label = { Text("IoU Thresh") },
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                    modifier = Modifier.fillMaxWidth()
+                )
+            }
+        },
+        confirmButton = {
+            Button(onClick = {
+                onSave(
+                    params.copy(
+                        processEvery = processEvery.toIntOrNull() ?: params.processEvery,
+                        trailLength = trailLength.toIntOrNull() ?: params.trailLength,
+                        trailMinAlpha = trailMinAlpha.toFloatOrNull() ?: params.trailMinAlpha,
+                        preferredClass = preferredClass,
+                        nmsScoreThreshold = nmsScore.toFloatOrNull() ?: params.nmsScoreThreshold,
+                        nmsIouThreshold = nmsIou.toFloatOrNull() ?: params.nmsIouThreshold
+                    )
+                )
+            }) {
+                Text("SAVE")
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("CANCEL") }
+        }
+    )
 }
 
 @Composable
-fun StatsOverlay(fps: Int, latency: Long) {
-    Column(
+fun CameraCaptureView(
+    previewView: PreviewView?,
+    isRecording: Boolean,
+    onRecordToggle: () -> Unit,
+    onPickVideo: () -> Unit,
+    onOpenSettings: () -> Unit
+) {
+    Box(modifier = Modifier.fillMaxSize()) {
+        if (previewView != null) {
+            AndroidView(factory = { previewView }, modifier = Modifier.fillMaxSize())
+        }
+
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(
+                    Brush.verticalGradient(
+                        colors = listOf(Color.Transparent, Color.Black.copy(alpha = 0.4f)),
+                        startY = 500f
+                    )
+                )
+        )
+
+        if (!isRecording) {
+            Column(
+                modifier = Modifier
+                    .align(Alignment.TopEnd)
+                    .padding(24.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(16.dp)
+            ) {
+                IconButton(
+                    onClick = onOpenSettings,
+                    modifier = Modifier
+                        .background(Color.Black.copy(alpha = 0.5f), CircleShape)
+                ) {
+                    Icon(Icons.Default.Settings, contentDescription = "Settings", tint = Color.White)
+                }
+
+                Button(
+                    onClick = onPickVideo,
+                    colors = ButtonDefaults.buttonColors(containerColor = Color.White.copy(alpha = 0.7f), contentColor = Color.Black)
+                ) {
+                    Text("GALLERY")
+                }
+            }
+        }
+
+        Column(
+            modifier = Modifier
+                .align(Alignment.BottomCenter)
+                .padding(bottom = 64.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            if (!isRecording) {
+                Text(
+                    "PIN TRACKER PRO",
+                    style = MaterialTheme.typography.headlineMedium,
+                    color = Color.White,
+                    fontWeight = FontWeight.ExtraBold,
+                    letterSpacing = 4.sp,
+                    modifier = Modifier.padding(bottom = 32.dp)
+                )
+            }
+
+            if (isRecording) {
+                Text(
+                    "REC",
+                    color = Color.Red,
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 18.sp,
+                    modifier = Modifier
+                        .background(Color.Black.copy(alpha = 0.5f), RoundedCornerShape(4.dp))
+                        .padding(horizontal = 12.dp, vertical = 4.dp)
+                )
+                Spacer(modifier = Modifier.height(16.dp))
+            }
+
+            Box(
+                contentAlignment = Alignment.Center,
+                modifier = Modifier
+                    .size(88.dp)
+                    .clip(CircleShape)
+                    .background(Color.White.copy(alpha = 0.2f))
+                    .padding(8.dp)
+                    .clip(CircleShape)
+                    .background(if (isRecording) Color.Red else Color.White)
+                    .clickable { onRecordToggle() }
+            ) {}
+
+            Spacer(modifier = Modifier.height(16.dp))
+            Text(
+                if (isRecording) "Stop Recording" else "Start Recording",
+                color = Color.White,
+                fontWeight = FontWeight.Medium
+            )
+        }
+    }
+}
+
+@Composable
+fun ProcessingView(videoUri: Uri?, progress: Float) {
+    Box(
         modifier = Modifier
-            .padding(16.dp)
-            .background(Color.Black.copy(alpha = 0.6f), RoundedCornerShape(8.dp))
-            .padding(8.dp)
-            .width(120.dp),
-        horizontalAlignment = Alignment.Start
+            .fillMaxSize()
+            .background(Color.Black),
+        contentAlignment = Alignment.Center
     ) {
-        Text(text = "FPS: $fps", color = Color.White, fontSize = 14.sp)
-        Text(text = "Latency: $latency ms", color = Color.White, fontSize = 14.sp)
+        if (videoUri != null) {
+            AndroidView(
+                factory = { context ->
+                    VideoView(context).apply {
+                        setVideoURI(videoUri)
+                        setOnPreparedListener { it.isLooping = true }
+                        start()
+                    }
+                },
+                modifier = Modifier.fillMaxSize()
+            )
+            // Dim the background video to make text readable
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(Color.Black.copy(alpha = 0.7f))
+            )
+        }
+
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(24.dp)
+        ) {
+            CircularProgressIndicator(
+                progress = { progress },
+                color = Color(0xFF00E676),
+                strokeWidth = 6.dp,
+                modifier = Modifier.size(120.dp)
+            )
+            
+            Text(
+                "AI ANALYSIS IN PROGRESS",
+                style = MaterialTheme.typography.titleLarge,
+                color = Color.White,
+                fontWeight = FontWeight.Bold,
+                letterSpacing = 2.sp
+            )
+            
+            Text(
+                "Analyzing Pin Physics: ${(progress * 100).toInt()}%",
+                style = MaterialTheme.typography.bodyLarge,
+                color = Color(0xFF00E676),
+                fontWeight = FontWeight.Medium
+            )
+            
+            Text(
+                "Applying Classical CV Engineering Pipeline...",
+                style = MaterialTheme.typography.bodySmall,
+                color = Color.Gray
+            )
+        }
+    }
+}
+
+@Composable
+fun ResultsView(
+    videoUri: Uri?,
+    onReset: () -> Unit
+) {
+    Box(modifier = Modifier.fillMaxSize().background(Color.Black)) {
+        if (videoUri != null) {
+            AndroidView(
+                factory = { context ->
+                    VideoView(context).apply {
+                        setVideoURI(videoUri)
+                        setOnPreparedListener { it.isLooping = true }
+                        start()
+                    }
+                },
+                modifier = Modifier.fillMaxSize()
+            )
+        } else {
+            Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                CircularProgressIndicator()
+            }
+        }
+
+        Column(
+            modifier = Modifier
+                .align(Alignment.BottomCenter)
+                .padding(32.dp)
+                .fillMaxWidth(),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            Button(
+                onClick = onReset,
+                shape = RoundedCornerShape(12.dp),
+                modifier = Modifier.height(56.dp).fillMaxWidth(0.6f),
+                colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary)
+            ) {
+                Icon(Icons.Default.Refresh, contentDescription = null)
+                Spacer(modifier = Modifier.width(8.dp))
+                Text("RECORD AGAIN", fontWeight = FontWeight.Bold)
+            }
+        }
     }
 }

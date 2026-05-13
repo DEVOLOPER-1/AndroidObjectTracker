@@ -3,27 +3,34 @@ package com.example.androidobjecttracker
 import android.Manifest
 import android.content.ContentValues
 import android.content.pm.PackageManager
-import android.graphics.Bitmap
-import android.graphics.Matrix
-import android.graphics.RectF
+import android.media.MediaScannerConnection
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.provider.MediaStore
-import android.util.Log
-import android.util.Size
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.camera.core.*
+import androidx.camera.core.CameraSelector
+import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.video.*
-import androidx.camera.video.VideoCapture
 import androidx.camera.view.PreviewView
 import androidx.compose.runtime.*
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.lifecycleScope
+import com.example.androidobjecttracker.pipeline.PipelineOrchestrator
+import com.example.androidobjecttracker.pipeline.PipelineParams
+import com.example.androidobjecttracker.processor.FastVideoProcessor
+import com.example.androidobjecttracker.processor.VideoEncoder
+import com.example.androidobjecttracker.ui.AppState
 import com.example.androidobjecttracker.ui.TrackingScreen
-import com.example.modelengine.ModelExecutor
+import com.example.androidobjecttracker.utils.AppLog
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.io.File
 import java.text.SimpleDateFormat
 import java.util.*
 import java.util.concurrent.ExecutorService
@@ -31,177 +38,150 @@ import java.util.concurrent.Executors
 
 class MainActivity : ComponentActivity() {
     private lateinit var cameraExecutor: ExecutorService
-    private lateinit var modelExecutor: ModelExecutor
     private var previewView: PreviewView? = null
+    private var cameraProvider: ProcessCameraProvider? = null
 
     private var videoCapture: VideoCapture<Recorder>? = null
     private var recording: Recording? = null
 
-    // Compose States
-    private var trackedBboxes by mutableStateOf<Map<Int, RectF>>(emptyMap())
-    private var fps by mutableIntStateOf(0)
-    private var latency by mutableLongStateOf(0L)
-    private var isRecording by mutableStateOf(false)
+    // App State
+    private var appState by mutableStateOf(AppState.IDLE)
+    private var resultVideoUri by mutableStateOf<Uri?>(null)
+    private var processingVideoUri by mutableStateOf<Uri?>(null)
+    private var pipelineParams by mutableStateOf(PipelineParams())
+    private var processingProgress by mutableFloatStateOf(0f)
 
-    // FPS Calculation
-    private var frameCount = 0
-    private var lastFpsTimestamp = 0L
+    private lateinit var orchestrator: PipelineOrchestrator
+    private lateinit var videoProcessor: FastVideoProcessor
 
-    // Initialization state
-    private val pendingRois = mutableListOf<RectF>()
+    private val pickVideoLauncher = registerForActivityResult(ActivityResultContracts.GetContent()) { uri: Uri? ->
+        uri?.let { startInAppProcessing(it) }
+    }
+
+    private var lastClickTime = 0L
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         
-        modelExecutor = ModelExecutor(this)
-        modelExecutor.loadModel("AbaViTrack_lite.ptl")
+        orchestrator = PipelineOrchestrator(this)
+        videoProcessor = FastVideoProcessor(this, orchestrator, VideoEncoder(this))
         
         cameraExecutor = Executors.newSingleThreadExecutor()
-        previewView = PreviewView(this)
+        previewView = PreviewView(this).apply {
+            implementationMode = PreviewView.ImplementationMode.COMPATIBLE
+        }
 
-        if (allPermissionsGranted()) {
-            startCamera()
-        } else {
+        if (!allPermissionsGranted()) {
             requestPermissions()
         }
 
         setContent {
             TrackingScreen(
-                previewView = previewView!!,
-                trackedBboxes = trackedBboxes,
-                fps = fps,
-                latency = latency,
-                isRecording = isRecording,
-                onRoiSelected = { roi ->
-                    synchronized(pendingRois) {
-                        pendingRois.add(roi)
+                appState = appState,
+                previewView = previewView,
+                resultVideoUri = resultVideoUri,
+                processingVideoUri = processingVideoUri,
+                pipelineParams = pipelineParams,
+                processingProgress = processingProgress,
+                onParamsChange = { pipelineParams = it },
+                onRecordToggle = {
+                    val now = System.currentTimeMillis()
+                    if (now - lastClickTime < 1000) return@TrackingScreen
+                    lastClickTime = now
+
+                    AppLog.i("Record Toggle Clicked. State: $appState")
+                    if (appState == AppState.RECORDING) {
+                        stopRecording()
+                    } else {
+                        startRecording()
                     }
                 },
                 onReset = {
-                    modelExecutor.reset()
-                    trackedBboxes = emptyMap()
-                    synchronized(pendingRois) {
-                        pendingRois.clear()
-                    }
+                    appState = AppState.IDLE
+                    resultVideoUri = null
+                    processingVideoUri = null
+                    processingProgress = 0f
+                    startCamera()
                 },
-                onToggleRecording = {
-                    if (isRecording) stopRecording() else startRecording()
+                onPickVideo = {
+                    pickVideoLauncher.launch("video/*")
                 }
             )
+        }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        if (allPermissionsGranted() && (appState == AppState.IDLE || appState == AppState.RECORDING)) {
+            startCamera()
         }
     }
 
     private fun startCamera() {
         val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
         cameraProviderFuture.addListener({
-            val cameraProvider = cameraProviderFuture.get()
+            cameraProvider = cameraProviderFuture.get()
+            val cameraProvider = cameraProvider ?: return@addListener
 
             val preview = Preview.Builder().build().also {
                 it.setSurfaceProvider(previewView?.surfaceProvider)
             }
 
+            val qualitySelector = QualitySelector.from(
+                Quality.HD,
+                FallbackStrategy.higherQualityOrLowerThan(Quality.HD)
+            )
             val recorder = Recorder.Builder()
-                .setQualitySelector(QualitySelector.from(Quality.HIGHEST))
+                .setQualitySelector(qualitySelector)
                 .build()
             videoCapture = VideoCapture.withOutput(recorder)
-
-            val imageAnalysis = ImageAnalysis.Builder()
-                .setTargetResolution(Size(1280, 720))
-                .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
-                .build()
-
-            imageAnalysis.setAnalyzer(cameraExecutor) { imageProxy ->
-                processImageProxy(imageProxy)
-            }
 
             val cameraSelector = CameraSelector.DEFAULT_BACK_CAMERA
 
             try {
                 cameraProvider.unbindAll()
-                cameraProvider.bindToLifecycle(this, cameraSelector, preview, imageAnalysis, videoCapture)
+                cameraProvider.bindToLifecycle(this, cameraSelector, preview, videoCapture)
+                AppLog.i("Camera bound successfully")
             } catch (exc: Exception) {
-                Log.e(TAG, "Use case binding failed", exc)
+                AppLog.e("Use case binding failed", exc)
+                Toast.makeText(this, "Camera binding failed: ${exc.message}", Toast.LENGTH_LONG).show()
             }
         }, ContextCompat.getMainExecutor(this))
     }
 
-    private fun processImageProxy(imageProxy: ImageProxy) {
-        val bitmap = imageProxyToBitmap(imageProxy)
-        imageProxy.close()
-
-        // 1. Process new ROIs
-        synchronized(pendingRois) {
-            if (pendingRois.isNotEmpty()) {
-                Log.d(TAG, "Processing ${pendingRois.size} pending ROIs")
-                for (roi in pendingRois) {
-                    val imageRoi = scaleBboxToImage(roi, bitmap.width, bitmap.height)
-                    Log.d(TAG, "Adding tracker for ROI: $roi -> Image ROI: $imageRoi")
-                    modelExecutor.addTracker(bitmap, imageRoi)
-                }
-                pendingRois.clear()
-            }
-        }
-
-        // 2. Run Tracking
-        val results = modelExecutor.trackAll(bitmap)
-        
-        // Update UI state using a temporary map to trigger recomposition properly
-        val updatedBboxes = results.mapValues { (id, bbox) ->
-            val viewBbox = scaleBboxToView(bbox, bitmap.width, bitmap.height)
-            if (results.size < 5) { // Avoid spamming if many trackers
-                Log.d(TAG, "Object $id: img=$bbox -> view=$viewBbox")
-            }
-            viewBbox
-        }
-        
-        // Use the main thread to update Compose state if not already there
-        runOnUiThread {
-            if (updatedBboxes.isNotEmpty() || trackedBboxes.isNotEmpty()) {
-                trackedBboxes = updatedBboxes
-            }
-            latency = modelExecutor.getLastInferenceTime()
-            updateFps()
-        }
-    }
-
     private fun startRecording() {
-        val videoCapture = this.videoCapture ?: return
-
-        isRecording = true
-
-        val name = SimpleDateFormat(FILENAME_FORMAT, Locale.US)
-            .format(System.currentTimeMillis())
-        val contentValues = ContentValues().apply {
-            put(MediaStore.MediaColumns.DISPLAY_NAME, name)
-            put(MediaStore.MediaColumns.MIME_TYPE, "video/mp4")
-            if (Build.VERSION.SDK_INT > Build.VERSION_CODES.P) {
-                put(MediaStore.Video.Media.RELATIVE_PATH, "Movies/CameraX-Video")
-            }
+        AppLog.i("startRecording() called")
+        val videoCapture = this.videoCapture
+        if (videoCapture == null) {
+            AppLog.e("videoCapture is null, cannot start recording")
+            Toast.makeText(this, "Camera not ready", Toast.LENGTH_SHORT).show()
+            return
         }
+        
+        appState = AppState.RECORDING
 
-        val mediaStoreOutputOptions = MediaStoreOutputOptions
-            .Builder(contentResolver, MediaStore.Video.Media.EXTERNAL_CONTENT_URI)
-            .setContentValues(contentValues)
-            .build()
+        val name = SimpleDateFormat(FILENAME_FORMAT, Locale.US).format(System.currentTimeMillis())
+        val movieDir = File(externalMediaDirs.firstOrNull() ?: filesDir, "TrackerInput")
+        if (!movieDir.exists()) movieDir.mkdirs()
+        val movieFile = File(movieDir, "$name.mp4")
+
+        val fileOutputOptions = FileOutputOptions.Builder(movieFile).build()
 
         recording = videoCapture.output
-            .prepareRecording(this, mediaStoreOutputOptions)
+            .prepareRecording(this, fileOutputOptions)
             .start(ContextCompat.getMainExecutor(this)) { recordEvent ->
                 when(recordEvent) {
                     is VideoRecordEvent.Start -> {
-                        isRecording = true
+                        AppLog.i("Recording started")
                     }
                     is VideoRecordEvent.Finalize -> {
-                        isRecording = false
                         if (!recordEvent.hasError()) {
-                            val msg = "Video capture succeeded: ${recordEvent.outputResults.outputUri}"
-                            Toast.makeText(baseContext, msg, Toast.LENGTH_SHORT).show()
-                            Log.d(TAG, msg)
+                            val uri = Uri.fromFile(movieFile)
+                            AppLog.i("Recording finalized: ${movieFile.absolutePath}")
+                            startInAppProcessing(uri)
                         } else {
-                            recording?.close()
-                            recording = null
-                            Log.e(TAG, "Video capture ends with error: ${recordEvent.error}")
+                            AppLog.e("Recording failed: ${recordEvent.error}")
+                            appState = AppState.IDLE
                         }
                     }
                 }
@@ -213,88 +193,36 @@ class MainActivity : ComponentActivity() {
         recording = null
     }
 
-    private fun imageProxyToBitmap(imageProxy: ImageProxy): Bitmap {
-        val bitmap = Bitmap.createBitmap(imageProxy.width, imageProxy.height, Bitmap.Config.ARGB_8888)
-        imageProxy.planes[0].buffer.rewind()
-        bitmap.copyPixelsFromBuffer(imageProxy.planes[0].buffer)
+    private fun startInAppProcessing(videoUri: Uri) {
+        appState = AppState.PROCESSING
+        processingVideoUri = videoUri
+        processingProgress = 0f
         
-        val matrix = Matrix()
-        matrix.postRotate(imageProxy.imageInfo.rotationDegrees.toFloat())
-        
-        return Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
-    }
-
-    private fun scaleBboxToView(bbox: RectF, imgW: Int, imgH: Int): RectF {
-        val view = previewView ?: return bbox
-        val viewW = view.width.toFloat()
-        val viewH = view.height.toFloat()
-        
-        // Calculate the scale factors while preserving aspect ratio (FIT_CENTER/FILL_CENTER)
-        // ImageAnalysis usually outputs images in a landscape-like orientation relative to sensor,
-        // but our bitmap is already rotated to match the portrait display.
-        
-        // If image is 1088x1088 (square) and screen is 720x1560 (tall)
-        // We need to find how that square is mapped into the tall view.
-        val imgAspectRatio = imgW.toFloat() / imgH
-        val viewAspectRatio = viewW / viewH
-
-        var finalScale: Float
-        var offsetX = 0f
-        var offsetY = 0f
-
-        if (viewAspectRatio > imgAspectRatio) {
-            // View is wider than image (relative to aspect ratio)
-            finalScale = viewH / imgH
-            offsetX = (viewW - imgW * finalScale) / 2f
-        } else {
-            // View is taller than image
-            finalScale = viewW / imgW
-            offsetY = (viewH - imgH * finalScale) / 2f
-        }
-        
-        return RectF(
-            bbox.left * finalScale + offsetX,
-            bbox.top * finalScale + offsetY,
-            bbox.right * finalScale + offsetX,
-            bbox.bottom * finalScale + offsetY
-        )
-    }
-
-    private fun scaleBboxToImage(roi: RectF, imgW: Int, imgH: Int): RectF {
-        val view = previewView ?: return roi
-        val viewW = view.width.toFloat()
-        val viewH = view.height.toFloat()
-        
-        val imgAspectRatio = imgW.toFloat() / imgH
-        val viewAspectRatio = viewW / viewH
-
-        var finalScale: Float
-        var offsetX = 0f
-        var offsetY = 0f
-
-        if (viewAspectRatio > imgAspectRatio) {
-            finalScale = viewH / imgH
-            offsetX = (viewW - imgW * finalScale) / 2f
-        } else {
-            finalScale = viewW / imgW
-            offsetY = (viewH - imgH * finalScale) / 2f
-        }
-        
-        return RectF(
-            (roi.left - offsetX) / finalScale,
-            (roi.top - offsetY) / finalScale,
-            (roi.right - offsetX) / finalScale,
-            (roi.bottom - offsetY) / finalScale
-        )
-    }
-
-    private fun updateFps() {
-        frameCount++
-        val now = System.currentTimeMillis()
-        if (now - lastFpsTimestamp >= 1000) {
-            fps = frameCount
-            frameCount = 0
-            lastFpsTimestamp = now
+        lifecycleScope.launch(Dispatchers.Main) {
+            try {
+                cameraProvider?.unbindAll()
+                
+                val resultUri = videoProcessor.processVideo(
+                    uri = videoUri,
+                    params = pipelineParams,
+                    onProgress = { progress ->
+                        processingProgress = progress
+                    }
+                )
+                
+                if (resultUri != null) {
+                    resultVideoUri = resultUri
+                    appState = AppState.RESULTS
+                    Toast.makeText(this@MainActivity, "Processing complete!", Toast.LENGTH_SHORT).show()
+                } else {
+                    appState = AppState.IDLE
+                    Toast.makeText(this@MainActivity, "Processing failed!", Toast.LENGTH_LONG).show()
+                }
+            } catch (e: Exception) {
+                AppLog.e("Processing error", e)
+                appState = AppState.IDLE
+                Toast.makeText(this@MainActivity, "Error: ${e.message}", Toast.LENGTH_LONG).show()
+            }
         }
     }
 
@@ -316,15 +244,14 @@ class MainActivity : ComponentActivity() {
     }
 
     companion object {
-        private const val TAG = "TrackerApp"
         private const val FILENAME_FORMAT = "yyyy-MM-dd-HH-mm-ss-SSS"
-        private val REQUIRED_PERMISSIONS = mutableListOf (
+        private val REQUIRED_PERMISSIONS = arrayOf(
             Manifest.permission.CAMERA,
-            Manifest.permission.RECORD_AUDIO
-        ).apply {
-            if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.P) {
-                add(Manifest.permission.WRITE_EXTERNAL_STORAGE)
-            }
-        }.toTypedArray()
+            Manifest.permission.RECORD_AUDIO,
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) 
+                Manifest.permission.READ_MEDIA_VIDEO 
+            else 
+                Manifest.permission.READ_EXTERNAL_STORAGE
+        )
     }
 }

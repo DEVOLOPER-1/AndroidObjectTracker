@@ -3,6 +3,10 @@ plugins {
     alias(libs.plugins.composeCompiler)
 }
 
+base {
+    archivesName.set("PinTrackerPro")
+}
+
 android {
     namespace = "com.example.androidobjecttracker"
     compileSdk = 36
@@ -37,9 +41,10 @@ android {
 }
 
 dependencies {
-    implementation(project(":model-engine"))
-    implementation(libs.pytorch.runtime)
-    implementation(libs.pytorch.vision)
+    implementation(libs.androidx.lifecycle.runtime.ktx)
+    implementation(libs.androidx.lifecycle.runtime.compose)
+    implementation(libs.kotlinx.coroutines.android)
+    implementation(libs.onnxruntime.android)
 
     implementation(platform(libs.androidx.compose.bom))
     implementation(libs.androidx.ui)
