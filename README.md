@@ -59,6 +59,12 @@ The application runs a multi-stage processing pipeline:
 
 ---
 
+## 📥 Download APK
+You can download the latest pre-built APK directly from the repository:
+**[Download PinTrackerPro.apk](./apk_release/PinTrackerPro.apk)**
+
+---
+
 ## 👥 Project Team
 **AndroidObjectTracker**
 Created for the Course: *DSAI 352 - Spring 2026*

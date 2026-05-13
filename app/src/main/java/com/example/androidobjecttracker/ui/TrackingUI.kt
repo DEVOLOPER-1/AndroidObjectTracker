@@ -39,6 +39,7 @@ fun TrackingScreen(
     appState: AppState,
     previewView: PreviewView?,
     resultVideoUri: Uri?,
+    processingVideoUri: Uri?,
     pipelineParams: PipelineParams,
     processingProgress: Float,
     onParamsChange: (PipelineParams) -> Unit,
@@ -69,7 +70,7 @@ fun TrackingScreen(
                         )
                     }
                     AppState.PROCESSING -> {
-                        ProcessingView(processingProgress)
+                        ProcessingView(processingVideoUri, processingProgress)
                     }
                     AppState.RESULTS -> {
                         ResultsView(resultVideoUri, onReset)
@@ -288,13 +289,32 @@ fun CameraCaptureView(
 }
 
 @Composable
-fun ProcessingView(progress: Float) {
+fun ProcessingView(videoUri: Uri?, progress: Float) {
     Box(
         modifier = Modifier
             .fillMaxSize()
-            .background(Color(0xFF0A0A0A)),
+            .background(Color.Black),
         contentAlignment = Alignment.Center
     ) {
+        if (videoUri != null) {
+            AndroidView(
+                factory = { context ->
+                    VideoView(context).apply {
+                        setVideoURI(videoUri)
+                        setOnPreparedListener { it.isLooping = true }
+                        start()
+                    }
+                },
+                modifier = Modifier.fillMaxSize()
+            )
+            // Dim the background video to make text readable
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(Color.Black.copy(alpha = 0.7f))
+            )
+        }
+
         Column(
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.spacedBy(24.dp)

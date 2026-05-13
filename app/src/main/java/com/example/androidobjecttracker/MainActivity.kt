@@ -47,6 +47,7 @@ class MainActivity : ComponentActivity() {
     // App State
     private var appState by mutableStateOf(AppState.IDLE)
     private var resultVideoUri by mutableStateOf<Uri?>(null)
+    private var processingVideoUri by mutableStateOf<Uri?>(null)
     private var pipelineParams by mutableStateOf(PipelineParams())
     private var processingProgress by mutableFloatStateOf(0f)
 
@@ -79,6 +80,7 @@ class MainActivity : ComponentActivity() {
                 appState = appState,
                 previewView = previewView,
                 resultVideoUri = resultVideoUri,
+                processingVideoUri = processingVideoUri,
                 pipelineParams = pipelineParams,
                 processingProgress = processingProgress,
                 onParamsChange = { pipelineParams = it },
@@ -97,6 +99,7 @@ class MainActivity : ComponentActivity() {
                 onReset = {
                     appState = AppState.IDLE
                     resultVideoUri = null
+                    processingVideoUri = null
                     processingProgress = 0f
                     startCamera()
                 },
@@ -192,6 +195,7 @@ class MainActivity : ComponentActivity() {
 
     private fun startInAppProcessing(videoUri: Uri) {
         appState = AppState.PROCESSING
+        processingVideoUri = videoUri
         processingProgress = 0f
         
         lifecycleScope.launch(Dispatchers.Main) {
