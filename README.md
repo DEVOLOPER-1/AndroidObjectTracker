@@ -1,8 +1,8 @@
 # AndroidObjectTracker
 
-**AndroidObjectTracker** is a high-performance, custom-engineered computer vision application for Android. It implements a sophisticated pipeline for real-time bowling pin detection, tracking, and cau[...]
+**AndroidObjectTracker** is a high-performance, custom-engineered computer vision application for Android. It implements a sophisticated pipeline for real-time bowling pin detection, tracking, and causal event analysis.
 
-Unlike standard implementations that rely on simple model-based classification to determine object states, this project utilizes a **classical CV engineering approach** to solve complex spatial and te[...]
+Unlike standard implementations that rely on simple model-based classification to determine object states, this project utilizes a classical CV engineering approach to solve complex spatial and temporal problems.
 
 ---
 
