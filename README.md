@@ -8,7 +8,7 @@ Unlike standard implementations that rely on simple model-based classification t
 
 ## 🎥 Demo
 
-<video src="https://github.com/DEVOLOPER-1/AndroidObjectTracker/raw/master/demo.mp4" controls playsinline muted></video>
+<video src="https://github.com/DEVOLOPER-1/AndroidObjectTracker/video_2026-05-13_23-02-23.mp4" controls playsinline muted></video>
 
 ---
 
